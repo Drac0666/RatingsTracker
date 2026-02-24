@@ -486,7 +486,7 @@ def build_html(
     history: pd.DataFrame,
     changes: pd.DataFrame,
     out_path: str,
-    rating_map: dict | None = None,
+    rating_map: Optional[dict] = None,
 ) -> None:
     """Generate a self-contained interactive HTML dashboard."""
     rating_map = rating_map or {}
