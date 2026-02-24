@@ -1105,7 +1105,7 @@ function drawChart(security) {{
   const nNc  = allChg.filter(c => c.Change_Type === 'NON_COMPARABLE').length;
   document.getElementById('infoBar').innerHTML =
     '<b style="color:#d0d8f0">' + security + '</b>' +
-    ' <button class="copy-btn" id="copyInfoBtn" title="Copy security name" onclick="copySecurity('info')">⎘ Copy</button>' +
+    ' <button class="copy-btn" id="copyInfoBtn" title="Copy security name" onclick="copySecurity(&#39;info&#39;)">⎘ Copy</button>' +
     ' &nbsp;|&nbsp; ' + rows.length + ' data points' +
     ' &nbsp;|&nbsp; ' + allChg.length + ' changes:' +
     ' <span class="tag tag-up">▲ ' + nUp + ' Upgrades</span>' +
