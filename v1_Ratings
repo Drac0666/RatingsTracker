@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SF Ratings Tracker (multi-select SEC filters + searchable Security)
+SF Ratings Tracker (Plotly DARK theme + multi-select SEC filters + searchable Security)
 
 Reads all Excel files in the current folder starting with "SF" (default: SF*.xlsx),
 aggregates them, then tracks rating changes over time on Security level.
@@ -29,6 +29,10 @@ Exports:
    - Security searchable type-in (datalist) + dropdown (select)
    - Line chart of rating time series per agency
 
+DARK THEME:
+- Uses Plotly template: "plotly_dark"
+- Sets page background to dark so it matches
+
 Rules:
 - 1..22 comparable rating scale (higher = better)
 - 23 = N/A, 24 = PIF
@@ -53,7 +57,6 @@ RATING_COLS = [
     "RTG_DBRS_MAPPED",
 ]
 
-# Standardized exact names required by user
 DATE_COL = "As_of_Date"
 SEC1_COL = "SEC 1"
 SEC2_COL = "SEC 2"
@@ -299,7 +302,6 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     months = sorted(hist[DATE_COL].dt.strftime("%Y-%m").dropna().unique().tolist())
     months = ["ALL"] + months if months else ["ALL"]
 
-    # Build options for SECs (strings for HTML)
     sec1_opts = sorted(meta[SEC1_COL].dropna().astype(str).unique().tolist())
     sec2_opts = sorted(meta[SEC2_COL].dropna().astype(str).unique().tolist())
     sec3_opts = sorted(meta[SEC3_COL].dropna().astype(str).unique().tolist())
@@ -328,23 +330,63 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
   <title>SF Ratings Tracker</title>
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 18px; }}
+    :root {{
+      --bg: #0b0f14;
+      --panel: #111826;
+      --panel2: #0f1624;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: #243042;
+      --accent: #3b82f6;
+    }}
+    body {{
+      font-family: Arial, sans-serif;
+      margin: 18px;
+      background: var(--bg);
+      color: var(--text);
+    }}
+    h2 {{ margin-top: 0; }}
     .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }}
     .control {{ display: flex; flex-direction: column; min-width: 220px; }}
-    label {{ font-size: 12px; color: #444; margin-bottom: 4px; }}
-    select, input {{ padding: 6px; }}
-    #chart {{ width: 100%; height: 640px; margin-top: 14px; }}
-    .hint {{ color: #666; font-size: 12px; margin-top: 10px; }}
-    .badge {{ display: inline-block; padding: 2px 8px; border: 1px solid #ccc; border-radius: 12px; font-size: 12px; margin-left: 8px; }}
-    .box {{
-      border: 1px solid #ddd; border-radius: 8px; padding: 8px;
-      max-height: 180px; overflow: auto; background: #fafafa;
+    label {{ font-size: 12px; color: var(--muted); margin-bottom: 6px; }}
+    select, input {{
+      padding: 8px;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      outline: none;
     }}
-    .box label {{ display: flex; gap: 8px; align-items: center; margin: 2px 0; font-size: 12px; color: #222; }}
-    .small {{ font-size: 12px; color: #666; margin-top: 4px; }}
+    select:focus, input:focus {{ border-color: var(--accent); }}
+    #chart {{ width: 100%; height: 640px; margin-top: 14px; }}
+    .hint {{ color: var(--muted); font-size: 12px; margin-top: 10px; }}
+    .badge {{
+      display: inline-block; padding: 2px 8px;
+      border: 1px solid var(--border); border-radius: 12px;
+      font-size: 12px; margin-left: 8px; background: var(--panel2); color: var(--text);
+    }}
+    .box {{
+      border: 1px solid var(--border); border-radius: 10px; padding: 8px;
+      max-height: 180px; overflow: auto; background: var(--panel2);
+    }}
+    .box label {{ display: flex; gap: 8px; align-items: center; margin: 2px 0; font-size: 12px; color: var(--text); }}
+    .small {{ font-size: 12px; color: var(--muted); margin-top: 6px; }}
     .wide {{ min-width: 360px; }}
-    .btnrow {{ display: flex; gap: 8px; margin-top: 6px; }}
-    button {{ padding: 6px 10px; cursor: pointer; }}
+    .btnrow {{ display: flex; gap: 8px; margin: 6px 0; }}
+    button {{
+      padding: 7px 10px;
+      cursor: pointer;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }}
+    button:hover {{ border-color: var(--accent); }}
+    input[type="checkbox"] {{
+      accent-color: var(--accent);
+      width: 14px; height: 14px;
+    }}
+    a {{ color: var(--accent); }}
   </style>
 </head>
 <body>
@@ -401,7 +443,7 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
       <datalist id="securityDatalist"></datalist>
       <div class="small">Pick from list or type exact Security; chart uses current selection below.</div>
 
-      <label style="margin-top:10px;">Security (filtered list)</label>
+      <label style="margin-top:12px;">Security (filtered list)</label>
       <select id="securitySelect"></select>
     </div>
   </div>
@@ -412,6 +454,7 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     <span class="badge">23 = N/A</span>
     <span class="badge">24 = PIF</span>
     <span class="badge">Up/Dn only when both 1..22</span>
+    <span class="badge">Theme: plotly_dark</span>
   </div>
 
   <div id="chart"></div>
@@ -447,26 +490,20 @@ function setOptions(selectEl, values) {{
   }}
 }}
 
-function fillMonth() {{
-  setOptions(monthSelect, DATA.months);
-}}
-
-fillMonth();
+setOptions(monthSelect, DATA.months);
 
 const metaBySecurity = new Map();
 for (const row of DATA.meta_rows) {{
   metaBySecurity.set(row.Security, row);
 }}
 
-function buildChecklist(container, values, groupName) {{
+function buildChecklist(container, values) {{
   container.innerHTML = "";
   for (const v of values) {{
-    const id = groupName + "_" + String(v).replace(/[^a-zA-Z0-9]/g, "_");
     const wrap = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.value = v;
-    cb.dataset.group = groupName;
     cb.addEventListener("change", refreshSecurityList);
     wrap.appendChild(cb);
     const t = document.createElement("span");
@@ -476,9 +513,9 @@ function buildChecklist(container, values, groupName) {{
   }}
 }}
 
-buildChecklist(sec1Box, DATA.sec1_opts, "sec1");
-buildChecklist(sec2Box, DATA.sec2_opts, "sec2");
-buildChecklist(sec3Box, DATA.sec3_opts, "sec3");
+buildChecklist(sec1Box, DATA.sec1_opts);
+buildChecklist(sec2Box, DATA.sec2_opts);
+buildChecklist(sec3Box, DATA.sec3_opts);
 
 function setAll(container, checked) {{
   const boxes = container.querySelectorAll("input[type=checkbox]");
@@ -494,20 +531,16 @@ sec3NoneBtn.addEventListener("click", () => {{ setAll(sec3Box, false); refreshSe
 
 function selectedValues(container) {{
   const boxes = Array.from(container.querySelectorAll("input[type=checkbox]"));
-  const checked = boxes.filter(cb => cb.checked).map(cb => cb.value);
-  // None checked => treat as "all"
-  return checked;
+  return boxes.filter(cb => cb.checked).map(cb => cb.value);
 }}
 
 function eligibleSecuritiesByMonthType(month, changeType) {{
-  // If no changes data, allow all securities
   if (!DATA.bucket_rows || DATA.bucket_rows.length === 0) {{
     return Object.keys(DATA.series_by_security);
   }}
 
   const secSet = new Set();
 
-  // "ALL" means any month, but still respect Change Type
   if (month === "ALL") {{
     for (const row of DATA.bucket_rows) {{
       if (row.Change_Type === changeType) {{
@@ -580,20 +613,15 @@ function refreshSecurityList() {{
 
   if (secs.length === 0) {{
     Plotly.purge("chart");
-    document.getElementById("chart").innerHTML = "<p>No securities match the selected Month/Type/SEC filters.</p>";
+    document.getElementById("chart").innerHTML = "<p style='color:#9ca3af'>No securities match the selected Month/Type/SEC filters.</p>";
     return;
   }}
 
-  // keep current selection if possible
-  const current = securitySelect.value;
-  if (!current || !secs.includes(current)) {{
-    securitySelect.value = secs[0];
-  }}
-
-  // If user typed something valid, prefer it
   const typed = securityInput.value;
   if (typed && secs.includes(typed)) {{
     securitySelect.value = typed;
+  }} else if (!securitySelect.value || !secs.includes(securitySelect.value)) {{
+    securitySelect.value = secs[0];
   }}
 
   renderChart();
@@ -628,12 +656,15 @@ function renderChart() {{
   }}
 
   const layout = {{
+    template: "plotly_dark",
     title: titleParts.join("  |  "),
     xaxis: {{ title: "{DATE_COL}" }},
     yaxis: {{ title: "Mapped Rating (1..22 scale, 23=N/A, 24=PIF)" }},
     legend: {{ orientation: "h" }},
     margin: {{ t: 70, r: 30, b: 60, l: 80 }},
-    hovermode: "x unified"
+    hovermode: "x unified",
+    paper_bgcolor: "rgba(0,0,0,0)",
+    plot_bgcolor: "rgba(0,0,0,0)"
   }};
 
   Plotly.newPlot("chart", traces, layout, {{responsive: true}});
@@ -642,22 +673,14 @@ function renderChart() {{
 monthSelect.addEventListener("change", refreshSecurityList);
 typeSelect.addEventListener("change", refreshSecurityList);
 
-// Security type-in behavior
-securityInput.addEventListener("change", () => {{
-  // If typed matches, select it
-  syncSelectToInputIfPossible();
-}});
-securityInput.addEventListener("keyup", () => {{
-  // live sync when it becomes exact match
-  syncSelectToInputIfPossible();
-}});
+securityInput.addEventListener("change", () => {{ syncSelectToInputIfPossible(); }});
+securityInput.addEventListener("keyup", () => {{ syncSelectToInputIfPossible(); }});
 
 securitySelect.addEventListener("change", () => {{
-  securityInput.value = securitySelect.value; // keep input in sync
+  securityInput.value = securitySelect.value;
   renderChart();
 }});
 
-// Initial load
 refreshSecurityList();
 securityInput.value = securitySelect.value;
 </script>
