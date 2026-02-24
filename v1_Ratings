@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+SF Ratings Tracker
+
+Reads all Excel files in the current folder that start with "SF" (default: SF*.xlsx),
+aggregates them, then tracks rating changes over time on Security level for:
+
+- RTG_FITCH_MAPPED
+- RTG_MOODY_MAPPED
+- RTG_SP_MAPPED
+- RTG_DBRS_MAPPED
+
+Exports:
+1) One Excel workbook with:
+   - rating_history  (Security rating timeline)
+   - all_changes     (any change, incl. NA/PIF transitions)
+   - downgrades      (only comparable downgrades within 1..22)
+   - upgrades        (only comparable upgrades within 1..22)
+
+2) One standalone interactive HTML (Plotly + embedded JS) where you can:
+   - pick Month (YYYY-MM)
+   - pick Change Type (Upgrade / Downgrade / Any)
+   - filter by Sec 1 / Sec 2 / Sec 3
+   - pick Security from the filtered list
+   - see line plots of each agency’s rating over time (and a small “change markers” overlay)
+
+Rating rules:
+- 1..22 = comparable rating scale (higher number = better rating)
+- 23 = N/A (Not Rated), 24 = PIF (Paid in Full)
+- Upgrades/Downgrades are only classified when BOTH before and after are in 1..22.
+  Everything else still appears in "all_changes" but is classified as "NON_COMPARABLE".
+
+Usage:
+  python sf_ratings_tracker.py
+  python sf_ratings_tracker.py --pattern "SF*.xlsx" --sheet 0
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+
+
+RATING_COLS = [
+    "RTG_FITCH_MAPPED",
+    "RTG_MOODY_MAPPED",
+    "RTG_SP_MAPPED",
+    "RTG_DBRS_MAPPED",
+]
+
+ID_COLS = ["as_of_Date", "Security", "Sec 1", "Sec 2", "Sec 3"]
+
+SPECIAL = {23: "N/A", 24: "PIF"}
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Make column names robust to accidental whitespace/case differences
+    rename = {c: c.strip() for c in df.columns}
+    df = df.rename(columns=rename)
+    return df
+
+
+def _parse_date(series: pd.Series) -> pd.Series:
+    # Handles Excel datetime, strings, etc.
+    s = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    return s.dt.normalize()
+
+
+def _as_int(series: pd.Series) -> pd.Series:
+    # Convert to nullable Int64
+    return pd.to_numeric(series, errors="coerce").round(0).astype("Int64")
+
+
+def load_all_files(pattern: str, sheet: str | int = 0) -> pd.DataFrame:
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No files found matching pattern: {pattern}")
+
+    dfs = []
+    for fp in files:
+        x = pd.read_excel(fp, sheet_name=sheet, dtype="object")
+        x = _normalize_columns(x)
+
+        missing = [c for c in (ID_COLS + RATING_COLS) if c not in x.columns]
+        if missing:
+            raise ValueError(
+                f"File '{os.path.basename(fp)}' missing required columns: {missing}"
+            )
+
+        x = x[ID_COLS + RATING_COLS].copy()
+        x["as_of_Date"] = _parse_date(x["as_of_Date"])
+        for c in RATING_COLS:
+            x[c] = _as_int(x[c])
+
+        x["__source_file__"] = os.path.basename(fp)
+        dfs.append(x)
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    # Drop rows with no key fields
+    df = df.dropna(subset=["as_of_Date", "Security"])
+    # Standardize Security to string (safe)
+    df["Security"] = df["Security"].astype(str)
+
+    # Deduplicate: if same Security+Date appears multiple times, keep the last occurrence
+    df = df.sort_values(["Security", "as_of_Date", "__source_file__"])
+    df = df.drop_duplicates(subset=["Security", "as_of_Date"], keep="last")
+
+    # If Sec 1/2/3 change over time, we keep latest for each date; history stays per date.
+    return df.sort_values(["Security", "as_of_Date"]).reset_index(drop=True)
+
+
+def classify_change(before: Optional[int], after: Optional[int]) -> Tuple[str, Optional[int]]:
+    """
+    Returns (change_type, direction)
+    change_type:
+      - "NO_CHANGE"
+      - "UPGRADE"
+      - "DOWNGRADE"
+      - "NON_COMPARABLE" (when before/after not both in 1..22)
+    direction:
+      - +1 for upgrade, -1 for downgrade, None otherwise
+    """
+    if pd.isna(before) and pd.isna(after):
+        return "NO_CHANGE", None
+    if before == after:
+        return "NO_CHANGE", None
+
+    # Only comparable if both in 1..22
+    if before is None or after is None or pd.isna(before) or pd.isna(after):
+        return "NON_COMPARABLE", None
+
+    b = int(before)
+    a = int(after)
+
+    if 1 <= b <= 22 and 1 <= a <= 22:
+        if a > b:
+            return "UPGRADE", +1
+        if a < b:
+            return "DOWNGRADE", -1
+        return "NO_CHANGE", None
+
+    return "NON_COMPARABLE", None
+
+
+def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each Security and each agency column, compare consecutive as_of_Date values and
+    emit an event row when the value changes.
+    """
+    out_rows: List[Dict] = []
+
+    # Ensure proper sort
+    df = df.sort_values(["Security", "as_of_Date"]).reset_index(drop=True)
+
+    for sec, g in df.groupby("Security", sort=False):
+        g = g.sort_values("as_of_Date").reset_index(drop=True)
+
+        for agency_col in RATING_COLS:
+            before_series = g[agency_col].shift(1)
+            after_series = g[agency_col]
+
+            changed_mask = before_series.ne(after_series) & ~(before_series.isna() & after_series.isna())
+            if not changed_mask.any():
+                continue
+
+            for idx in g.index[changed_mask]:
+                before = before_series.loc[idx]
+                after = after_series.loc[idx]
+                change_type, direction = classify_change(before, after)
+
+                out_rows.append(
+                    {
+                        "Security": sec,
+                        "Sec 1": g.loc[idx, "Sec 1"],
+                        "Sec 2": g.loc[idx, "Sec 2"],
+                        "Sec 3": g.loc[idx, "Sec 3"],
+                        "as_of_Date": g.loc[idx, "as_of_Date"],
+                        "Agency_Column": agency_col,
+                        "RTG_MAPPED_before": before,
+                        "RTG_MAPPED_after": after,
+                        "Change_Type": change_type,
+                        "Direction": direction,
+                        "Before_Label": SPECIAL.get(int(before), None) if pd.notna(before) else None,
+                        "After_Label": SPECIAL.get(int(after), None) if pd.notna(after) else None,
+                    }
+                )
+
+    changes = pd.DataFrame(out_rows)
+    if changes.empty:
+        # Keep consistent schema
+        changes = pd.DataFrame(
+            columns=[
+                "Security",
+                "Sec 1",
+                "Sec 2",
+                "Sec 3",
+                "as_of_Date",
+                "Agency_Column",
+                "RTG_MAPPED_before",
+                "RTG_MAPPED_after",
+                "Change_Type",
+                "Direction",
+                "Before_Label",
+                "After_Label",
+            ]
+        )
+
+    # Add month key for reporting/UI
+    if not changes.empty:
+        changes["YearMonth"] = changes["as_of_Date"].dt.strftime("%Y-%m")
+    else:
+        changes["YearMonth"] = pd.Series(dtype="object")
+
+    return changes.sort_values(["as_of_Date", "Security", "Agency_Column"]).reset_index(drop=True)
+
+
+def export_excel(df_history: pd.DataFrame, changes: pd.DataFrame, out_xlsx: str) -> None:
+    rating_history = df_history.copy()
+    rating_history = rating_history.sort_values(["Security", "as_of_Date"])
+
+    all_changes = changes.copy()
+    downgrades = changes[changes["Change_Type"] == "DOWNGRADE"].copy()
+    upgrades = changes[changes["Change_Type"] == "UPGRADE"].copy()
+
+    # A compact, user-friendly column order
+    rating_cols_order = ["as_of_Date", "Security", "Sec 1", "Sec 2", "Sec 3"] + RATING_COLS
+    rating_history = rating_history[rating_cols_order]
+
+    change_cols_order = [
+        "as_of_Date",
+        "YearMonth",
+        "Security",
+        "Sec 1",
+        "Sec 2",
+        "Sec 3",
+        "Agency_Column",
+        "RTG_MAPPED_before",
+        "RTG_MAPPED_after",
+        "Change_Type",
+        "Direction",
+        "Before_Label",
+        "After_Label",
+    ]
+    all_changes = all_changes.reindex(columns=change_cols_order)
+    downgrades = downgrades.reindex(columns=change_cols_order)
+    upgrades = upgrades.reindex(columns=change_cols_order)
+
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+        rating_history.to_excel(w, index=False, sheet_name="rating_history")
+        all_changes.to_excel(w, index=False, sheet_name="all_changes")
+        downgrades.to_excel(w, index=False, sheet_name="downgrades")
+        upgrades.to_excel(w, index=False, sheet_name="upgrades")
+
+
+def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_html: str) -> None:
+    """
+    Creates a standalone HTML with embedded Plotly and simple JS-based filtering.
+    Filtering logic:
+      - Month (YYYY-MM) + ChangeType (Upgrade/Downgrade/Any)
+      - Sec 1/2/3 dropdown filters
+      - Security dropdown depends on current filters (Month/Type + Sec1/2/3)
+    """
+    # Precompute per-security timeseries data
+    hist = df_history.sort_values(["Security", "as_of_Date"]).copy()
+    hist["as_of_Date_str"] = hist["as_of_Date"].dt.strftime("%Y-%m-%d")
+
+    # Per-security metadata (Sec1/2/3) — take latest non-null values
+    meta = (
+        hist.sort_values(["Security", "as_of_Date"])
+        .groupby("Security", as_index=False)[["Sec 1", "Sec 2", "Sec 3"]]
+        .last()
+    )
+
+    # Serialize history per security
+    series_by_security: Dict[str, Dict] = {}
+    for sec, g in hist.groupby("Security", sort=False):
+        series_by_security[sec] = {
+            "dates": g["as_of_Date_str"].tolist(),
+            "sec1": (g["Sec 1"].iloc[-1] if len(g) else None),
+            "sec2": (g["Sec 2"].iloc[-1] if len(g) else None),
+            "sec3": (g["Sec 3"].iloc[-1] if len(g) else None),
+            "ratings": {c: [None if pd.isna(v) else int(v) for v in g[c].tolist()] for c in RATING_COLS},
+        }
+
+    # Build “eligible security list per month + type” based on changes (any agency)
+    ch = changes.copy()
+    if not ch.empty:
+        # A month/type bucket per security if any agency had that type
+        bucket = (
+            ch.assign(_flag=1)
+            .groupby(["YearMonth", "Change_Type", "Security"], as_index=False)["_flag"]
+            .sum()
+        )
+    else:
+        bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security", "_flag"])
+
+    # Also allow "Any" bucket = any change (including NON_COMPARABLE)
+    if not ch.empty:
+        bucket_any = (
+            ch.assign(_flag=1)
+            .groupby(["YearMonth", "Security"], as_index=False)["_flag"]
+            .sum()
+        )
+        bucket_any["Change_Type"] = "ANY"
+        bucket = pd.concat([bucket, bucket_any], ignore_index=True)
+    else:
+        bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security", "_flag"])
+
+    # Month options
+    months = sorted(hist["as_of_Date"].dt.strftime("%Y-%m").dropna().unique().tolist())
+    if not months:
+        months = ["(none)"]
+
+    # Distinct Sec 1/2/3 options
+    sec1_opts = sorted([x for x in meta["Sec 1"].dropna().astype(str).unique().tolist()])
+    sec2_opts = sorted([x for x in meta["Sec 2"].dropna().astype(str).unique().tolist()])
+    sec3_opts = sorted([x for x in meta["Sec 3"].dropna().astype(str).unique().tolist()])
+
+    payload = {
+        "months": months,
+        "series_by_security": series_by_security,
+        "bucket_rows": bucket[["YearMonth", "Change_Type", "Security"]].to_dict("records"),
+        "meta_rows": meta.assign(
+            **{
+                "Sec 1": meta["Sec 1"].astype(str),
+                "Sec 2": meta["Sec 2"].astype(str),
+                "Sec 3": meta["Sec 3"].astype(str),
+            }
+        )[["Security", "Sec 1", "Sec 2", "Sec 3"]].to_dict("records"),
+        "sec1_opts": sec1_opts,
+        "sec2_opts": sec2_opts,
+        "sec3_opts": sec3_opts,
+        "rating_cols": RATING_COLS,
+    }
+
+    # Standalone HTML (CDN plotly)
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>SF Ratings Tracker</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 18px; }}
+    .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: end; }}
+    .control {{ display: flex; flex-direction: column; min-width: 220px; }}
+    label {{ font-size: 12px; color: #444; margin-bottom: 4px; }}
+    select {{ padding: 6px; }}
+    #chart {{ width: 100%; height: 640px; }}
+    .hint {{ color: #666; font-size: 12px; margin-top: 10px; }}
+    .badge {{ display: inline-block; padding: 2px 8px; border: 1px solid #ccc; border-radius: 12px; font-size: 12px; margin-left: 8px; }}
+  </style>
+</head>
+<body>
+  <h2>SF Ratings Tracker (Interactive)</h2>
+
+  <div class="row">
+    <div class="control">
+      <label>Month (as_of_Date)</label>
+      <select id="monthSelect"></select>
+    </div>
+
+    <div class="control">
+      <label>Change Type</label>
+      <select id="typeSelect">
+        <option value="ANY">Any (all change types)</option>
+        <option value="UPGRADE">Upgrade</option>
+        <option value="DOWNGRADE">Downgrade</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Sec 1 (optional filter)</label>
+      <select id="sec1Select">
+        <option value="">(all)</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Sec 2 (optional filter)</label>
+      <select id="sec2Select">
+        <option value="">(all)</option>
+      </select>
+    </div>
+
+    <div class="control">
+      <label>Sec 3 (optional filter)</label>
+      <select id="sec3Select">
+        <option value="">(all)</option>
+      </select>
+    </div>
+
+    <div class="control" style="min-width: 360px;">
+      <label>Security (filtered)</label>
+      <select id="securitySelect"></select>
+    </div>
+  </div>
+
+  <div class="hint">
+    Notes:
+    <span class="badge">1..22 comparable</span>
+    <span class="badge">23 = N/A</span>
+    <span class="badge">24 = PIF</span>
+    <span class="badge">Up/Dn only when both 1..22</span>
+  </div>
+
+  <div id="chart"></div>
+
+<script>
+const DATA = {json.dumps(payload)};
+
+function setOptions(selectEl, values, includeBlank=false, blankLabel="(all)") {{
+  selectEl.innerHTML = "";
+  if (includeBlank) {{
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = blankLabel;
+    selectEl.appendChild(opt);
+  }}
+  for (const v of values) {{
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    selectEl.appendChild(opt);
+  }}
+}}
+
+function unique(arr) {{
+  return Array.from(new Set(arr));
+}}
+
+const monthSelect = document.getElementById("monthSelect");
+const typeSelect = document.getElementById("typeSelect");
+const sec1Select = document.getElementById("sec1Select");
+const sec2Select = document.getElementById("sec2Select");
+const sec3Select = document.getElementById("sec3Select");
+const securitySelect = document.getElementById("securitySelect");
+
+setOptions(monthSelect, DATA.months);
+setOptions(sec1Select, DATA.sec1_opts, true);
+setOptions(sec2Select, DATA.sec2_opts, true);
+setOptions(sec3Select, DATA.sec3_opts, true);
+
+const metaBySecurity = new Map();
+for (const r of DATA.meta_rows) {{
+  metaBySecurity.set(r.Security, r);
+}}
+
+function eligibleSecuritiesByMonthType(month, changeType) {{
+  if (!DATA.bucket_rows || DATA.bucket_rows.length === 0) {{
+    // If no changes file, just allow all securities
+    return Object.keys(DATA.series_by_security);
+  }}
+  const secSet = new Set();
+  for (const r of DATA.bucket_rows) {{
+    if (r.YearMonth === month && r.Change_Type === changeType) {{
+      secSet.add(r.Security);
+    }}
+  }}
+  // If nothing matches (e.g., no upgrades that month), return empty
+  return Array.from(secSet);
+}}
+
+function applySecFilters(securities) {{
+  const s1 = sec1Select.value;
+  const s2 = sec2Select.value;
+  const s3 = sec3Select.value;
+
+  return securities.filter(sec => {{
+    const m = metaBySecurity.get(sec);
+    if (!m) return false;
+    if (s1 && String(m["Sec 1"]) !== s1) return false;
+    if (s2 && String(m["Sec 2"]) !== s2) return false;
+    if (s3 && String(m["Sec 3"]) !== s3) return false;
+    return true;
+  }});
+}}
+
+function refreshSecurityList() {{
+  const month = monthSelect.value;
+  const type = typeSelect.value;
+
+  let secs = eligibleSecuritiesByMonthType(month, type);
+  secs = applySecFilters(secs);
+  secs = secs.sort();
+
+  setOptions(securitySelect, secs);
+
+  // Keep selection if possible
+  if (secs.length === 0) {{
+    Plotly.purge("chart");
+    document.getElementById("chart").innerHTML = "<p>No securities match the selected Month/Type/SEC filters.</p>";
+    return;
+  }}
+
+  // If previously selected not available, pick first
+  const current = securitySelect.value;
+  if (!current || !secs.includes(current)) {{
+    securitySelect.value = secs[0];
+  }}
+  renderChart();
+}}
+
+function renderChart() {{
+  const sec = securitySelect.value;
+  const item = DATA.series_by_security[sec];
+  if (!item) return;
+
+  const dates = item.dates;
+
+  const traces = [];
+  for (const col of DATA.rating_cols) {{
+    traces.push({{
+      x: dates,
+      y: item.ratings[col],
+      mode: "lines+markers",
+      name: col,
+      connectgaps: false
+    }});
+  }}
+
+  const titleParts = [sec];
+  const m = metaBySecurity.get(sec);
+  if (m) {{
+    titleParts.push(`Sec1=${m["Sec 1"]}`, `Sec2=${m["Sec 2"]}`, `Sec3=${m["Sec 3"]}`);
+  }}
+
+  const layout = {{
+    title: titleParts.join("  |  "),
+    xaxis: {{ title: "as_of_Date" }},
+    yaxis: {{ title: "Mapped Rating (1..22 scale, 23=N/A, 24=PIF)", autorange: true }},
+    legend: {{ orientation: "h" }},
+    margin: {{ t: 70, r: 30, b: 60, l: 80 }},
+    hovermode: "x unified"
+  }};
+
+  Plotly.newPlot("chart", traces, layout, {{responsive: true}});
+}}
+
+monthSelect.addEventListener("change", refreshSecurityList);
+typeSelect.addEventListener("change", refreshSecurityList);
+sec1Select.addEventListener("change", refreshSecurityList);
+sec2Select.addEventListener("change", refreshSecurityList);
+sec3Select.addEventListener("change", refreshSecurityList);
+securitySelect.addEventListener("change", renderChart);
+
+// Initialize
+refreshSecurityList();
+</script>
+</body>
+</html>
+"""
+
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pattern", default="SF*.xlsx", help="File glob pattern (default: SF*.xlsx)")
+    ap.add_argument("--sheet", default=0, help="Sheet name or index (default: 0)")
+    ap.add_argument("--out-xlsx", default="SF_Rating_Tracking_Output.xlsx", help="Output Excel filename")
+    ap.add_argument("--out-html", default="SF_Rating_Tracking_Interactive.html", help="Output HTML filename")
+    args = ap.parse_args()
+
+    df = load_all_files(args.pattern, sheet=args.sheet)
+
+    changes = build_change_events(df)
+
+    export_excel(df, changes, args.out_xlsx)
+    build_interactive_html(df, changes, args.out_html)
+
+    print("Done.")
+    print(f"Excel written to: {os.path.abspath(args.out_xlsx)}")
+    print(f"HTML written to:  {os.path.abspath(args.out_html)}")
+    print(f"Rows in history:  {len(df):,}")
+    print(f"Change events:    {len(changes):,}")
+
+
+if __name__ == "__main__":
+    main()
