@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SF Ratings Tracker (fixed column names + JS fix)
+SF Ratings Tracker (full script)
 
 Reads all Excel files in the current folder starting with "SF" (default: SF*.xlsx),
 aggregates them, then tracks rating changes over time on Security level.
@@ -23,11 +23,13 @@ Exports:
    - downgrades
    - upgrades
 2) Interactive HTML (Plotly) with Month + Upgrade/Downgrade/Any + SEC filters + Security selection.
+   - Month dropdown includes "ALL" (across any month)
 
 Rules:
 - 1..22 comparable rating scale (higher = better)
 - 23 = N/A, 24 = PIF
 - Up/Dn classification only when BOTH before and after are in 1..22
+- "Any" in the UI includes all change types (incl. NON_COMPARABLE and NO_CHANGE is not emitted as an event)
 """
 
 from __future__ import annotations
@@ -210,7 +212,7 @@ def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
 
     changes = pd.DataFrame(out_rows)
     if changes.empty:
-        changes = pd.DataFrame(
+        return pd.DataFrame(
             columns=[
                 "Security",
                 SEC1_COL,
@@ -227,7 +229,6 @@ def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
                 "YearMonth",
             ]
         )
-        return changes
 
     changes["YearMonth"] = changes[DATE_COL].dt.strftime("%Y-%m")
     return changes.sort_values([DATE_COL, "Security", "Agency_Column"]).reset_index(drop=True)
@@ -306,7 +307,9 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     else:
         bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security"])
 
-    months = sorted(hist[DATE_COL].dt.strftime("%Y-%m").dropna().unique().tolist()) or ["(none)"]
+    # Month list + ALL option
+    months = sorted(hist[DATE_COL].dt.strftime("%Y-%m").dropna().unique().tolist())
+    months = ["ALL"] + months if months else ["ALL"]
 
     sec1_opts = sorted(meta[SEC1_COL].dropna().astype(str).unique().tolist())
     sec2_opts = sorted(meta[SEC2_COL].dropna().astype(str).unique().tolist())
@@ -327,10 +330,8 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
         "sec2_opts": sec2_opts,
         "sec3_opts": sec3_opts,
         "rating_cols": RATING_COLS,
-        "sec_cols": [SEC1_COL, SEC2_COL, SEC3_COL],
     }
 
-    # IMPORTANT: JS fix — no variable named `m` anywhere.
     html = f"""<!doctype html>
 <html>
 <head>
@@ -434,10 +435,24 @@ for (const row of DATA.meta_rows) {{
 }}
 
 function eligibleSecuritiesByMonthType(month, changeType) {{
+  // If no changes data, allow all securities
   if (!DATA.bucket_rows || DATA.bucket_rows.length === 0) {{
     return Object.keys(DATA.series_by_security);
   }}
+
   const secSet = new Set();
+
+  // "ALL" means: any month, but still respect Change Type
+  if (month === "ALL") {{
+    for (const row of DATA.bucket_rows) {{
+      if (row.Change_Type === changeType) {{
+        secSet.add(row.Security);
+      }}
+    }}
+    return Array.from(secSet);
+  }}
+
+  // Normal month filtering
   for (const row of DATA.bucket_rows) {{
     if (row.YearMonth === month && row.Change_Type === changeType) {{
       secSet.add(row.Security);
