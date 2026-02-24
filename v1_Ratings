@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-SF Ratings Tracker
+SF Ratings Tracker (fixed column names + JS fix)
 
-Reads all Excel files in the current folder that start with "SF" (default: SF*.xlsx),
-aggregates them, then tracks rating changes over time on Security level for:
+Reads all Excel files in the current folder starting with "SF" (default: SF*.xlsx),
+aggregates them, then tracks rating changes over time on Security level.
 
+Expected (standardized) columns:
+- As_of_Date
+- Security
+- SEC 1
+- SEC 2
+- SEC 3
 - RTG_FITCH_MAPPED
 - RTG_MOODY_MAPPED
 - RTG_SP_MAPPED
 - RTG_DBRS_MAPPED
 
 Exports:
-1) One Excel workbook with:
-   - rating_history  (Security rating timeline)
-   - all_changes     (any change, incl. NA/PIF transitions)
-   - downgrades      (only comparable downgrades within 1..22)
-   - upgrades        (only comparable upgrades within 1..22)
+1) Excel workbook:
+   - rating_history
+   - all_changes
+   - downgrades
+   - upgrades
+2) Interactive HTML (Plotly) with Month + Upgrade/Downgrade/Any + SEC filters + Security selection.
 
-2) One standalone interactive HTML (Plotly + embedded JS) where you can:
-   - pick Month (YYYY-MM)
-   - pick Change Type (Upgrade / Downgrade / Any)
-   - filter by Sec 1 / Sec 2 / Sec 3
-   - pick Security from the filtered list
-   - see line plots of each agency’s rating over time (and a small “change markers” overlay)
-
-Rating rules:
-- 1..22 = comparable rating scale (higher number = better rating)
-- 23 = N/A (Not Rated), 24 = PIF (Paid in Full)
-- Upgrades/Downgrades are only classified when BOTH before and after are in 1..22.
-  Everything else still appears in "all_changes" but is classified as "NON_COMPARABLE".
-
-Usage:
-  python sf_ratings_tracker.py
-  python sf_ratings_tracker.py --pattern "SF*.xlsx" --sheet 0
+Rules:
+- 1..22 comparable rating scale (higher = better)
+- 23 = N/A, 24 = PIF
+- Up/Dn classification only when BOTH before and after are in 1..22
 """
 
 from __future__ import annotations
@@ -41,7 +36,6 @@ import argparse
 import glob
 import json
 import os
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -54,26 +48,64 @@ RATING_COLS = [
     "RTG_DBRS_MAPPED",
 ]
 
-ID_COLS = ["as_of_Date", "Security", "Sec 1", "Sec 2", "Sec 3"]
+# Standardized exact names required by user
+DATE_COL = "As_of_Date"
+SEC1_COL = "SEC 1"
+SEC2_COL = "SEC 2"
+SEC3_COL = "SEC 3"
+
+ID_COLS = [DATE_COL, "Security", SEC1_COL, SEC2_COL, SEC3_COL]
 
 SPECIAL = {23: "N/A", 24: "PIF"}
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # Make column names robust to accidental whitespace/case differences
-    rename = {c: c.strip() for c in df.columns}
-    df = df.rename(columns=rename)
+def _clean_name(s: str) -> str:
+    """Lowercase + collapse whitespace/underscores for robust matching."""
+    return " ".join(str(s).replace("_", " ").split()).strip().lower()
+
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Renames input columns (any casing/underscore/whitespace variants) to exact required names:
+    As_of_Date, SEC 1, SEC 2, SEC 3, Security, and rating columns.
+    """
+    colmap: Dict[str, str] = {}
+    for c in df.columns:
+        key = _clean_name(c)
+
+        if key in {"as of date", "as_of_date", "as of_date", "asof date", "asof_date"}:
+            colmap[c] = DATE_COL
+        elif key in {"sec 1", "sec1", "sec_1"}:
+            colmap[c] = SEC1_COL
+        elif key in {"sec 2", "sec2", "sec_2"}:
+            colmap[c] = SEC2_COL
+        elif key in {"sec 3", "sec3", "sec_3"}:
+            colmap[c] = SEC3_COL
+        elif key in {"security"}:
+            colmap[c] = "Security"
+        elif key == _clean_name("RTG_FITCH_MAPPED"):
+            colmap[c] = "RTG_FITCH_MAPPED"
+        elif key == _clean_name("RTG_MOODY_MAPPED"):
+            colmap[c] = "RTG_MOODY_MAPPED"
+        elif key == _clean_name("RTG_SP_MAPPED"):
+            colmap[c] = "RTG_SP_MAPPED"
+        elif key == _clean_name("RTG_DBRS_MAPPED"):
+            colmap[c] = "RTG_DBRS_MAPPED"
+
+    df = df.rename(columns=colmap)
+
+    # Strip exact column names too (in case of trailing spaces)
+    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+
     return df
 
 
 def _parse_date(series: pd.Series) -> pd.Series:
-    # Handles Excel datetime, strings, etc.
-    s = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    s = pd.to_datetime(series, errors="coerce")
     return s.dt.normalize()
 
 
 def _as_int(series: pd.Series) -> pd.Series:
-    # Convert to nullable Int64
     return pd.to_numeric(series, errors="coerce").round(0).astype("Int64")
 
 
@@ -85,16 +117,20 @@ def load_all_files(pattern: str, sheet: str | int = 0) -> pd.DataFrame:
     dfs = []
     for fp in files:
         x = pd.read_excel(fp, sheet_name=sheet, dtype="object")
-        x = _normalize_columns(x)
+        x = _standardize_columns(x)
 
-        missing = [c for c in (ID_COLS + RATING_COLS) if c not in x.columns]
+        required = ID_COLS + RATING_COLS
+        missing = [c for c in required if c not in x.columns]
         if missing:
             raise ValueError(
-                f"File '{os.path.basename(fp)}' missing required columns: {missing}"
+                f"File '{os.path.basename(fp)}' missing required columns after standardization: {missing}\n"
+                f"Columns found: {list(x.columns)}"
             )
 
-        x = x[ID_COLS + RATING_COLS].copy()
-        x["as_of_Date"] = _parse_date(x["as_of_Date"])
+        x = x[required].copy()
+        x[DATE_COL] = _parse_date(x[DATE_COL])
+        x["Security"] = x["Security"].astype(str)
+
         for c in RATING_COLS:
             x[c] = _as_int(x[c])
 
@@ -103,36 +139,21 @@ def load_all_files(pattern: str, sheet: str | int = 0) -> pd.DataFrame:
 
     df = pd.concat(dfs, ignore_index=True)
 
-    # Drop rows with no key fields
-    df = df.dropna(subset=["as_of_Date", "Security"])
-    # Standardize Security to string (safe)
-    df["Security"] = df["Security"].astype(str)
+    df = df.dropna(subset=[DATE_COL, "Security"])
 
-    # Deduplicate: if same Security+Date appears multiple times, keep the last occurrence
-    df = df.sort_values(["Security", "as_of_Date", "__source_file__"])
-    df = df.drop_duplicates(subset=["Security", "as_of_Date"], keep="last")
+    # If same Security+Date exists multiple times, keep last occurrence (latest file order)
+    df = df.sort_values(["Security", DATE_COL, "__source_file__"])
+    df = df.drop_duplicates(subset=["Security", DATE_COL], keep="last")
 
-    # If Sec 1/2/3 change over time, we keep latest for each date; history stays per date.
-    return df.sort_values(["Security", "as_of_Date"]).reset_index(drop=True)
+    return df.sort_values(["Security", DATE_COL]).reset_index(drop=True)
 
 
 def classify_change(before: Optional[int], after: Optional[int]) -> Tuple[str, Optional[int]]:
-    """
-    Returns (change_type, direction)
-    change_type:
-      - "NO_CHANGE"
-      - "UPGRADE"
-      - "DOWNGRADE"
-      - "NON_COMPARABLE" (when before/after not both in 1..22)
-    direction:
-      - +1 for upgrade, -1 for downgrade, None otherwise
-    """
     if pd.isna(before) and pd.isna(after):
         return "NO_CHANGE", None
     if before == after:
         return "NO_CHANGE", None
 
-    # Only comparable if both in 1..22
     if before is None or after is None or pd.isna(before) or pd.isna(after):
         return "NON_COMPARABLE", None
 
@@ -150,17 +171,12 @@ def classify_change(before: Optional[int], after: Optional[int]) -> Tuple[str, O
 
 
 def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each Security and each agency column, compare consecutive as_of_Date values and
-    emit an event row when the value changes.
-    """
     out_rows: List[Dict] = []
 
-    # Ensure proper sort
-    df = df.sort_values(["Security", "as_of_Date"]).reset_index(drop=True)
+    df = df.sort_values(["Security", DATE_COL]).reset_index(drop=True)
 
     for sec, g in df.groupby("Security", sort=False):
-        g = g.sort_values("as_of_Date").reset_index(drop=True)
+        g = g.sort_values(DATE_COL).reset_index(drop=True)
 
         for agency_col in RATING_COLS:
             before_series = g[agency_col].shift(1)
@@ -178,10 +194,10 @@ def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
                 out_rows.append(
                     {
                         "Security": sec,
-                        "Sec 1": g.loc[idx, "Sec 1"],
-                        "Sec 2": g.loc[idx, "Sec 2"],
-                        "Sec 3": g.loc[idx, "Sec 3"],
-                        "as_of_Date": g.loc[idx, "as_of_Date"],
+                        SEC1_COL: g.loc[idx, SEC1_COL],
+                        SEC2_COL: g.loc[idx, SEC2_COL],
+                        SEC3_COL: g.loc[idx, SEC3_COL],
+                        DATE_COL: g.loc[idx, DATE_COL],
                         "Agency_Column": agency_col,
                         "RTG_MAPPED_before": before,
                         "RTG_MAPPED_after": after,
@@ -194,14 +210,13 @@ def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
 
     changes = pd.DataFrame(out_rows)
     if changes.empty:
-        # Keep consistent schema
         changes = pd.DataFrame(
             columns=[
                 "Security",
-                "Sec 1",
-                "Sec 2",
-                "Sec 3",
-                "as_of_Date",
+                SEC1_COL,
+                SEC2_COL,
+                SEC3_COL,
+                DATE_COL,
                 "Agency_Column",
                 "RTG_MAPPED_before",
                 "RTG_MAPPED_after",
@@ -209,37 +224,32 @@ def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
                 "Direction",
                 "Before_Label",
                 "After_Label",
+                "YearMonth",
             ]
         )
+        return changes
 
-    # Add month key for reporting/UI
-    if not changes.empty:
-        changes["YearMonth"] = changes["as_of_Date"].dt.strftime("%Y-%m")
-    else:
-        changes["YearMonth"] = pd.Series(dtype="object")
-
-    return changes.sort_values(["as_of_Date", "Security", "Agency_Column"]).reset_index(drop=True)
+    changes["YearMonth"] = changes[DATE_COL].dt.strftime("%Y-%m")
+    return changes.sort_values([DATE_COL, "Security", "Agency_Column"]).reset_index(drop=True)
 
 
 def export_excel(df_history: pd.DataFrame, changes: pd.DataFrame, out_xlsx: str) -> None:
-    rating_history = df_history.copy()
-    rating_history = rating_history.sort_values(["Security", "as_of_Date"])
+    rating_history = df_history.sort_values(["Security", DATE_COL]).copy()
 
     all_changes = changes.copy()
     downgrades = changes[changes["Change_Type"] == "DOWNGRADE"].copy()
     upgrades = changes[changes["Change_Type"] == "UPGRADE"].copy()
 
-    # A compact, user-friendly column order
-    rating_cols_order = ["as_of_Date", "Security", "Sec 1", "Sec 2", "Sec 3"] + RATING_COLS
+    rating_cols_order = [DATE_COL, "Security", SEC1_COL, SEC2_COL, SEC3_COL] + RATING_COLS
     rating_history = rating_history[rating_cols_order]
 
     change_cols_order = [
-        "as_of_Date",
+        DATE_COL,
         "YearMonth",
         "Security",
-        "Sec 1",
-        "Sec 2",
-        "Sec 3",
+        SEC1_COL,
+        SEC2_COL,
+        SEC3_COL,
         "Agency_Column",
         "RTG_MAPPED_before",
         "RTG_MAPPED_after",
@@ -260,49 +270,32 @@ def export_excel(df_history: pd.DataFrame, changes: pd.DataFrame, out_xlsx: str)
 
 
 def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_html: str) -> None:
-    """
-    Creates a standalone HTML with embedded Plotly and simple JS-based filtering.
-    Filtering logic:
-      - Month (YYYY-MM) + ChangeType (Upgrade/Downgrade/Any)
-      - Sec 1/2/3 dropdown filters
-      - Security dropdown depends on current filters (Month/Type + Sec1/2/3)
-    """
-    # Precompute per-security timeseries data
-    hist = df_history.sort_values(["Security", "as_of_Date"]).copy()
-    hist["as_of_Date_str"] = hist["as_of_Date"].dt.strftime("%Y-%m-%d")
+    hist = df_history.sort_values(["Security", DATE_COL]).copy()
+    hist["As_of_Date_str"] = hist[DATE_COL].dt.strftime("%Y-%m-%d")
 
-    # Per-security metadata (Sec1/2/3) — take latest non-null values
+    # latest SEC fields per security
     meta = (
-        hist.sort_values(["Security", "as_of_Date"])
-        .groupby("Security", as_index=False)[["Sec 1", "Sec 2", "Sec 3"]]
+        hist.sort_values(["Security", DATE_COL])
+        .groupby("Security", as_index=False)[[SEC1_COL, SEC2_COL, SEC3_COL]]
         .last()
     )
 
-    # Serialize history per security
     series_by_security: Dict[str, Dict] = {}
     for sec, g in hist.groupby("Security", sort=False):
         series_by_security[sec] = {
-            "dates": g["as_of_Date_str"].tolist(),
-            "sec1": (g["Sec 1"].iloc[-1] if len(g) else None),
-            "sec2": (g["Sec 2"].iloc[-1] if len(g) else None),
-            "sec3": (g["Sec 3"].iloc[-1] if len(g) else None),
+            "dates": g["As_of_Date_str"].tolist(),
             "ratings": {c: [None if pd.isna(v) else int(v) for v in g[c].tolist()] for c in RATING_COLS},
         }
 
-    # Build “eligible security list per month + type” based on changes (any agency)
+    # buckets of eligible securities by YearMonth & Change_Type (any agency)
     ch = changes.copy()
     if not ch.empty:
-        # A month/type bucket per security if any agency had that type
         bucket = (
             ch.assign(_flag=1)
             .groupby(["YearMonth", "Change_Type", "Security"], as_index=False)["_flag"]
             .sum()
         )
-    else:
-        bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security", "_flag"])
 
-    # Also allow "Any" bucket = any change (including NON_COMPARABLE)
-    if not ch.empty:
         bucket_any = (
             ch.assign(_flag=1)
             .groupby(["YearMonth", "Security"], as_index=False)["_flag"]
@@ -311,17 +304,13 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
         bucket_any["Change_Type"] = "ANY"
         bucket = pd.concat([bucket, bucket_any], ignore_index=True)
     else:
-        bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security", "_flag"])
+        bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security"])
 
-    # Month options
-    months = sorted(hist["as_of_Date"].dt.strftime("%Y-%m").dropna().unique().tolist())
-    if not months:
-        months = ["(none)"]
+    months = sorted(hist[DATE_COL].dt.strftime("%Y-%m").dropna().unique().tolist()) or ["(none)"]
 
-    # Distinct Sec 1/2/3 options
-    sec1_opts = sorted([x for x in meta["Sec 1"].dropna().astype(str).unique().tolist()])
-    sec2_opts = sorted([x for x in meta["Sec 2"].dropna().astype(str).unique().tolist()])
-    sec3_opts = sorted([x for x in meta["Sec 3"].dropna().astype(str).unique().tolist()])
+    sec1_opts = sorted(meta[SEC1_COL].dropna().astype(str).unique().tolist())
+    sec2_opts = sorted(meta[SEC2_COL].dropna().astype(str).unique().tolist())
+    sec3_opts = sorted(meta[SEC3_COL].dropna().astype(str).unique().tolist())
 
     payload = {
         "months": months,
@@ -329,18 +318,19 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
         "bucket_rows": bucket[["YearMonth", "Change_Type", "Security"]].to_dict("records"),
         "meta_rows": meta.assign(
             **{
-                "Sec 1": meta["Sec 1"].astype(str),
-                "Sec 2": meta["Sec 2"].astype(str),
-                "Sec 3": meta["Sec 3"].astype(str),
+                SEC1_COL: meta[SEC1_COL].astype(str),
+                SEC2_COL: meta[SEC2_COL].astype(str),
+                SEC3_COL: meta[SEC3_COL].astype(str),
             }
-        )[["Security", "Sec 1", "Sec 2", "Sec 3"]].to_dict("records"),
+        )[["Security", SEC1_COL, SEC2_COL, SEC3_COL]].to_dict("records"),
         "sec1_opts": sec1_opts,
         "sec2_opts": sec2_opts,
         "sec3_opts": sec3_opts,
         "rating_cols": RATING_COLS,
+        "sec_cols": [SEC1_COL, SEC2_COL, SEC3_COL],
     }
 
-    # Standalone HTML (CDN plotly)
+    # IMPORTANT: JS fix — no variable named `m` anywhere.
     html = f"""<!doctype html>
 <html>
 <head>
@@ -363,7 +353,7 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
 
   <div class="row">
     <div class="control">
-      <label>Month (as_of_Date)</label>
+      <label>Month ({DATE_COL})</label>
       <select id="monthSelect"></select>
     </div>
 
@@ -377,24 +367,18 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     </div>
 
     <div class="control">
-      <label>Sec 1 (optional filter)</label>
-      <select id="sec1Select">
-        <option value="">(all)</option>
-      </select>
+      <label>{SEC1_COL} (optional filter)</label>
+      <select id="sec1Select"><option value="">(all)</option></select>
     </div>
 
     <div class="control">
-      <label>Sec 2 (optional filter)</label>
-      <select id="sec2Select">
-        <option value="">(all)</option>
-      </select>
+      <label>{SEC2_COL} (optional filter)</label>
+      <select id="sec2Select"><option value="">(all)</option></select>
     </div>
 
     <div class="control">
-      <label>Sec 3 (optional filter)</label>
-      <select id="sec3Select">
-        <option value="">(all)</option>
-      </select>
+      <label>{SEC3_COL} (optional filter)</label>
+      <select id="sec3Select"><option value="">(all)</option></select>
     </div>
 
     <div class="control" style="min-width: 360px;">
@@ -416,6 +400,13 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
 <script>
 const DATA = {json.dumps(payload)};
 
+const monthSelect = document.getElementById("monthSelect");
+const typeSelect = document.getElementById("typeSelect");
+const sec1Select = document.getElementById("sec1Select");
+const sec2Select = document.getElementById("sec2Select");
+const sec3Select = document.getElementById("sec3Select");
+const securitySelect = document.getElementById("securitySelect");
+
 function setOptions(selectEl, values, includeBlank=false, blankLabel="(all)") {{
   selectEl.innerHTML = "";
   if (includeBlank) {{
@@ -432,53 +423,40 @@ function setOptions(selectEl, values, includeBlank=false, blankLabel="(all)") {{
   }}
 }}
 
-function unique(arr) {{
-  return Array.from(new Set(arr));
-}}
-
-const monthSelect = document.getElementById("monthSelect");
-const typeSelect = document.getElementById("typeSelect");
-const sec1Select = document.getElementById("sec1Select");
-const sec2Select = document.getElementById("sec2Select");
-const sec3Select = document.getElementById("sec3Select");
-const securitySelect = document.getElementById("securitySelect");
-
 setOptions(monthSelect, DATA.months);
 setOptions(sec1Select, DATA.sec1_opts, true);
 setOptions(sec2Select, DATA.sec2_opts, true);
 setOptions(sec3Select, DATA.sec3_opts, true);
 
 const metaBySecurity = new Map();
-for (const r of DATA.meta_rows) {{
-  metaBySecurity.set(r.Security, r);
+for (const row of DATA.meta_rows) {{
+  metaBySecurity.set(row.Security, row);
 }}
 
 function eligibleSecuritiesByMonthType(month, changeType) {{
   if (!DATA.bucket_rows || DATA.bucket_rows.length === 0) {{
-    // If no changes file, just allow all securities
     return Object.keys(DATA.series_by_security);
   }}
   const secSet = new Set();
-  for (const r of DATA.bucket_rows) {{
-    if (r.YearMonth === month && r.Change_Type === changeType) {{
-      secSet.add(r.Security);
+  for (const row of DATA.bucket_rows) {{
+    if (row.YearMonth === month && row.Change_Type === changeType) {{
+      secSet.add(row.Security);
     }}
   }}
-  // If nothing matches (e.g., no upgrades that month), return empty
   return Array.from(secSet);
 }}
 
 function applySecFilters(securities) {{
-  const s1 = sec1Select.value;
-  const s2 = sec2Select.value;
-  const s3 = sec3Select.value;
+  const f1 = sec1Select.value;
+  const f2 = sec2Select.value;
+  const f3 = sec3Select.value;
 
   return securities.filter(sec => {{
-    const m = metaBySecurity.get(sec);
-    if (!m) return false;
-    if (s1 && String(m["Sec 1"]) !== s1) return false;
-    if (s2 && String(m["Sec 2"]) !== s2) return false;
-    if (s3 && String(m["Sec 3"]) !== s3) return false;
+    const metaRow = metaBySecurity.get(sec);
+    if (!metaRow) return false;
+    if (f1 && String(metaRow["{SEC1_COL}"]) !== f1) return false;
+    if (f2 && String(metaRow["{SEC2_COL}"]) !== f2) return false;
+    if (f3 && String(metaRow["{SEC3_COL}"]) !== f3) return false;
     return true;
   }});
 }}
@@ -488,21 +466,17 @@ function refreshSecurityList() {{
   const type = typeSelect.value;
 
   let secs = eligibleSecuritiesByMonthType(month, type);
-  secs = applySecFilters(secs);
-  secs = secs.sort();
+  secs = applySecFilters(secs).sort();
 
   setOptions(securitySelect, secs);
 
-  // Keep selection if possible
   if (secs.length === 0) {{
     Plotly.purge("chart");
     document.getElementById("chart").innerHTML = "<p>No securities match the selected Month/Type/SEC filters.</p>";
     return;
   }}
 
-  // If previously selected not available, pick first
-  const current = securitySelect.value;
-  if (!current || !secs.includes(current)) {{
+  if (!securitySelect.value || !secs.includes(securitySelect.value)) {{
     securitySelect.value = secs[0];
   }}
   renderChart();
@@ -527,15 +501,19 @@ function renderChart() {{
   }}
 
   const titleParts = [sec];
-  const m = metaBySecurity.get(sec);
-  if (m) {{
-    titleParts.push(`Sec1=${m["Sec 1"]}`, `Sec2=${m["Sec 2"]}`, `Sec3=${m["Sec 3"]}`);
+  const metaRow = metaBySecurity.get(sec);
+  if (metaRow) {{
+    titleParts.push(
+      "{SEC1_COL}=" + metaRow["{SEC1_COL}"],
+      "{SEC2_COL}=" + metaRow["{SEC2_COL}"],
+      "{SEC3_COL}=" + metaRow["{SEC3_COL}"]
+    );
   }}
 
   const layout = {{
     title: titleParts.join("  |  "),
-    xaxis: {{ title: "as_of_Date" }},
-    yaxis: {{ title: "Mapped Rating (1..22 scale, 23=N/A, 24=PIF)", autorange: true }},
+    xaxis: {{ title: "{DATE_COL}" }},
+    yaxis: {{ title: "Mapped Rating (1..22 scale, 23=N/A, 24=PIF)" }},
     legend: {{ orientation: "h" }},
     margin: {{ t: 70, r: 30, b: 60, l: 80 }},
     hovermode: "x unified"
@@ -551,7 +529,6 @@ sec2Select.addEventListener("change", refreshSecurityList);
 sec3Select.addEventListener("change", refreshSecurityList);
 securitySelect.addEventListener("change", renderChart);
 
-// Initialize
 refreshSecurityList();
 </script>
 </body>
@@ -571,7 +548,6 @@ def main():
     args = ap.parse_args()
 
     df = load_all_files(args.pattern, sheet=args.sheet)
-
     changes = build_change_events(df)
 
     export_excel(df, changes, args.out_xlsx)
