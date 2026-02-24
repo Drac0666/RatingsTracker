@@ -18,6 +18,8 @@ Fixes included:
 - HTML Security list no longer "empty" when CHANGES is empty or filters yield no change rows:
   it falls back to HISTORY to populate securities.
 - Y-axis in Plotly chart shows rating LETTERS (from rating map) for 1..22 plus NR/PIF for 23/24.
+- NEW: If a rating agency series for a security has ALL non-null points == 23 (Not Rated),
+  it is automatically hidden (not plotted) for that security view.
 """
 
 import argparse
@@ -540,7 +542,7 @@ def _records_to_json(df: pd.DataFrame) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Interactive HTML (fixed filtering + rating letters on Y-axis)
+# Interactive HTML
 # ---------------------------------------------------------------------------
 
 
@@ -664,10 +666,6 @@ def build_html(
     border-bottom:1px solid #1a2040; min-height:34px; display:flex; align-items:center;
     gap:10px; flex-wrap:wrap;
   }}
-  .tag {{ display:inline-block; padding:2px 9px; border-radius:10px; font-size:.73rem; font-weight:700; }}
-  .tag-up {{ background:#1a4a2a; color:#50ff90; }}
-  .tag-dn {{ background:#4a1a1a; color:#ff6060; }}
-  .tag-nc {{ background:#3a3a18; color:#ffd050; }}
   #chartArea {{ padding:18px 28px; }}
   #noData {{ color:#3a4a6a; text-align:center; padding:80px 20px; font-size:1rem; }}
   #chartDiv {{ min-height:420px; }}
@@ -743,10 +741,7 @@ def build_html(
   </div>
   <div class="sec-selector">
     <span class="ctrl-label">Security Search &amp; Select</span>
-    <div style="display:flex;gap:6px;align-items:center">
-      <input id="secSearch" type="text" placeholder="Type to search…" list="secDatalist" autocomplete="off" style="flex:1"/>
-      <button class="copy-btn" id="copySearchBtn" title="Copy security name" onclick="copySecurity('search')">⎘ Copy</button>
-    </div>
+    <input id="secSearch" type="text" placeholder="Type to search…" list="secDatalist" autocomplete="off"/>
     <datalist id="secDatalist"></datalist>
     <select id="secList" size="5"></select>
   </div>
@@ -787,23 +782,14 @@ for (const s of Object.keys(histBySec))
 
 const monthSel = document.getElementById('monthSel');
 for (const [ym, days] of Object.entries(YEAR_MONTHS_GROUPED)) {{
-  if (days.length === 1) {{
-    const o = document.createElement('option');
-    o.value = days[0]; o.textContent = days[0];
-    monthSel.appendChild(o);
-  }} else {{
-    const grpOpt = document.createElement('option');
-    grpOpt.value = ym; grpOpt.textContent = '📅 ' + ym;
-    grpOpt.style.fontWeight = 'bold'; grpOpt.style.color = '#38c9ff';
-    monthSel.appendChild(grpOpt);
-    for (const day of days) {{
-      const o = document.createElement('option');
-      o.value = day; o.textContent = '  ' + day;
-      monthSel.appendChild(o);
-    }}
-  }}
+  const grpOpt = document.createElement('option');
+  grpOpt.value = ym; grpOpt.textContent = '📅 ' + ym;
+  grpOpt.style.fontWeight = 'bold'; grpOpt.style.color = '#38c9ff';
+  monthSel.appendChild(grpOpt);
 }}
+/* keep "ALL" + month buckets (YYYY-MM). */
 
+/* Checkbox groups */
 function buildCheckboxGroup(groupId, vals) {{
   const g = document.getElementById(groupId);
   g.innerHTML = '';
@@ -833,10 +819,8 @@ function getFilteredSecurities() {{
 
   function historyMatchesPeriod(rows) {{
     if (month === 'ALL') return rows.length > 0;
-    if (month.length === 7) {{
-      return rows.some(r => String(r.As_of_Date || '').startsWith(month));
-    }}
-    return rows.some(r => String(r.As_of_Date) === month);
+    // month is YYYY-MM
+    return rows.some(r => String(r.As_of_Date || '').startsWith(month));
   }}
 
   function historyMatchesSecFilters(rows) {{
@@ -848,9 +832,7 @@ function getFilteredSecurities() {{
   }}
 
   const filteredChanges = CHANGES.filter(c => {{
-    if (month !== 'ALL') {{
-      if (c.As_of_Date !== month && c.YearMonth !== month) return false;
-    }}
+    if (month !== 'ALL' && c.YearMonth !== month) return false;
     if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
     return true;
   }});
@@ -935,7 +917,6 @@ const AGENCY_SHORT = {{
   RTG_FITCH_MAPPED: 'F', RTG_MOODY_MAPPED: 'M', RTG_SP_MAPPED: 'S', RTG_DBRS_MAPPED: 'D',
 }};
 
-/* Hover label */
 function ratingLabel(v) {{
   if (v === null || v === undefined) return 'N/A';
   const letter = RATING_MAP[String(Math.round(v))];
@@ -945,7 +926,6 @@ function ratingLabel(v) {{
   return String(Math.round(v));
 }}
 
-/* Y-axis ticks as letters (1..22 + NR/PIF) */
 function buildYAxisTicks() {{
   const vals = [];
   const labels = [];
@@ -954,7 +934,6 @@ function buildYAxisTicks() {{
     vals.push(i);
     labels.push(RATING_MAP[String(i)] || String(i));
   }}
-
   vals.push(23); labels.push("NR");
   vals.push(24); labels.push("PIF");
 
@@ -962,6 +941,7 @@ function buildYAxisTicks() {{
 }}
 const Y_TICKS = buildYAxisTicks();
 
+/* Chart (with auto-hide if ALL points are Not Rated == 23) */
 function drawChart(security) {{
   const rows = histBySec[security] || [];
   if (!rows.length) return;
@@ -969,11 +949,24 @@ function drawChart(security) {{
   const traces = [];
   for (const col of RATING_COLS) {{
     const x = [], y = [], txt = [];
+    const nonNullY = [];
+
     for (const r of rows) {{
       const v = r[col];
       if (v === null || v === undefined) continue;
+      nonNullY.push(v);
       x.push(r.As_of_Date); y.push(v); txt.push(ratingLabel(v));
     }}
+
+    // NEW: hide entire series when ALL non-null points are NR (23)
+    if (nonNullY.length > 0) {{
+      const allNR = nonNullY.every(v => Number(v) === 23);
+      if (allNR) continue;
+    }}
+
+    // If the series has no points at all, don't plot it either
+    if (y.length === 0) continue;
+
     traces.push({{
       x, y, text: txt, mode: 'lines+markers',
       name: AGENCY_LABELS[col],
@@ -1030,7 +1023,14 @@ function drawChart(security) {{
   document.getElementById('noData').style.display = 'none';
   const chartDiv = document.getElementById('chartDiv');
   chartDiv.style.display = '';
-  Plotly.react(chartDiv, traces, layout, {{ responsive:true, displayModeBar:true, displaylogo:false }});
+
+  // If all agencies were hidden, show a message instead of blank plot
+  if (traces.length === 0) {{
+    Plotly.purge(chartDiv);
+    chartDiv.innerHTML = "<div style='color:#6070a0;padding:30px;text-align:center'>All rating agency series are Not Rated (NR) for this security, so they were hidden.</div>";
+  }} else {{
+    Plotly.react(chartDiv, traces, layout, {{ responsive:true, displayModeBar:true, displaylogo:false }});
+  }}
 
   renderChangesTable(secChanges);
 }}
@@ -1060,27 +1060,13 @@ function renderChangesTable(secChanges) {{
   document.getElementById('changesSection').style.display = '';
 }}
 
-function copySecurity(source) {{
-  const sec = document.getElementById('secSearch').value.trim();
-  if (!sec) return;
-  navigator.clipboard.writeText(sec).then(() => {{
-    const btn = document.getElementById(source === 'info' ? 'copyInfoBtn' : 'copySearchBtn');
-    if (!btn) return;
-    const prev = btn.textContent;
-    btn.textContent = '✓ Copied'; btn.classList.add('copied');
-    setTimeout(() => {{ btn.textContent = prev; btn.classList.remove('copied'); }}, 1500);
-  }}).catch(() => {{}});
-}}
-
 function exportFilteredCSV() {{
   const month  = monthSel.value;
   const chgTyp = document.getElementById('changeTypeSel').value;
   const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
 
   const filtered = CHANGES.filter(c => {{
-    if (month !== 'ALL') {{
-      if (c.As_of_Date !== month && c.YearMonth !== month) return false;
-    }}
+    if (month !== 'ALL' && c.YearMonth !== month) return false;
     if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
     const rows = histBySec[c.Security] || [];
     return rows.some(r =>
@@ -1170,16 +1156,13 @@ def main() -> None:
     log.info("Max HTML securities  : %d", args.max_html_securities)
     log.info("Excel output         : %s", args.out_xlsx)
     log.info("HTML output          : %s", args.out_html)
-    if args.dry_run:
-        log.info("DRY RUN — no files will be written.")
 
     if args.dry_run:
         files = sorted(glob.glob(args.pattern))
-        log.info("Files that would be processed (%d):", len(files))
+        log.info("DRY RUN — files that would be processed (%d):", len(files))
         for f in files:
             sz = os.path.getsize(f) / 1024
             log.info("  %s  (%.1f KB)", f, sz)
-        log.info("Dry run complete — nothing written.")
         return
 
     log.info("Step 0: Loading rating map…")
