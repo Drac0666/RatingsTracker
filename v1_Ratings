@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SF Ratings Tracker (full script)
+SF Ratings Tracker (multi-select SEC filters + searchable Security)
 
 Reads all Excel files in the current folder starting with "SF" (default: SF*.xlsx),
 aggregates them, then tracks rating changes over time on Security level.
@@ -22,14 +22,17 @@ Exports:
    - all_changes
    - downgrades
    - upgrades
-2) Interactive HTML (Plotly) with Month + Upgrade/Downgrade/Any + SEC filters + Security selection.
-   - Month dropdown includes "ALL" (across any month)
+2) Interactive HTML (Plotly) with:
+   - Month dropdown incl. "ALL"
+   - Change Type dropdown
+   - SEC 1/2/3 multi-select check lists
+   - Security searchable type-in (datalist) + dropdown (select)
+   - Line chart of rating time series per agency
 
 Rules:
 - 1..22 comparable rating scale (higher = better)
 - 23 = N/A, 24 = PIF
 - Up/Dn classification only when BOTH before and after are in 1..22
-- "Any" in the UI includes all change types (incl. NON_COMPARABLE and NO_CHANGE is not emitted as an event)
 """
 
 from __future__ import annotations
@@ -62,15 +65,10 @@ SPECIAL = {23: "N/A", 24: "PIF"}
 
 
 def _clean_name(s: str) -> str:
-    """Lowercase + collapse whitespace/underscores for robust matching."""
     return " ".join(str(s).replace("_", " ").split()).strip().lower()
 
 
 def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Renames input columns (any casing/underscore/whitespace variants) to exact required names:
-    As_of_Date, SEC 1, SEC 2, SEC 3, Security, and rating columns.
-    """
     colmap: Dict[str, str] = {}
     for c in df.columns:
         key = _clean_name(c)
@@ -95,10 +93,7 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
             colmap[c] = "RTG_DBRS_MAPPED"
 
     df = df.rename(columns=colmap)
-
-    # Strip exact column names too (in case of trailing spaces)
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
-
     return df
 
 
@@ -140,10 +135,8 @@ def load_all_files(pattern: str, sheet: str | int = 0) -> pd.DataFrame:
         dfs.append(x)
 
     df = pd.concat(dfs, ignore_index=True)
-
     df = df.dropna(subset=[DATE_COL, "Security"])
 
-    # If same Security+Date exists multiple times, keep last occurrence (latest file order)
     df = df.sort_values(["Security", DATE_COL, "__source_file__"])
     df = df.drop_duplicates(subset=["Security", DATE_COL], keep="last")
 
@@ -174,7 +167,6 @@ def classify_change(before: Optional[int], after: Optional[int]) -> Tuple[str, O
 
 def build_change_events(df: pd.DataFrame) -> pd.DataFrame:
     out_rows: List[Dict] = []
-
     df = df.sort_values(["Security", DATE_COL]).reset_index(drop=True)
 
     for sec, g in df.groupby("Security", sort=False):
@@ -274,7 +266,6 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     hist = df_history.sort_values(["Security", DATE_COL]).copy()
     hist["As_of_Date_str"] = hist[DATE_COL].dt.strftime("%Y-%m-%d")
 
-    # latest SEC fields per security
     meta = (
         hist.sort_values(["Security", DATE_COL])
         .groupby("Security", as_index=False)[[SEC1_COL, SEC2_COL, SEC3_COL]]
@@ -288,7 +279,6 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
             "ratings": {c: [None if pd.isna(v) else int(v) for v in g[c].tolist()] for c in RATING_COLS},
         }
 
-    # buckets of eligible securities by YearMonth & Change_Type (any agency)
     ch = changes.copy()
     if not ch.empty:
         bucket = (
@@ -296,7 +286,6 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
             .groupby(["YearMonth", "Change_Type", "Security"], as_index=False)["_flag"]
             .sum()
         )
-
         bucket_any = (
             ch.assign(_flag=1)
             .groupby(["YearMonth", "Security"], as_index=False)["_flag"]
@@ -307,10 +296,10 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     else:
         bucket = pd.DataFrame(columns=["YearMonth", "Change_Type", "Security"])
 
-    # Month list + ALL option
     months = sorted(hist[DATE_COL].dt.strftime("%Y-%m").dropna().unique().tolist())
     months = ["ALL"] + months if months else ["ALL"]
 
+    # Build options for SECs (strings for HTML)
     sec1_opts = sorted(meta[SEC1_COL].dropna().astype(str).unique().tolist())
     sec2_opts = sorted(meta[SEC2_COL].dropna().astype(str).unique().tolist())
     sec3_opts = sorted(meta[SEC3_COL].dropna().astype(str).unique().tolist())
@@ -340,13 +329,22 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
   <style>
     body {{ font-family: Arial, sans-serif; margin: 18px; }}
-    .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: end; }}
+    .row {{ display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }}
     .control {{ display: flex; flex-direction: column; min-width: 220px; }}
     label {{ font-size: 12px; color: #444; margin-bottom: 4px; }}
-    select {{ padding: 6px; }}
-    #chart {{ width: 100%; height: 640px; }}
+    select, input {{ padding: 6px; }}
+    #chart {{ width: 100%; height: 640px; margin-top: 14px; }}
     .hint {{ color: #666; font-size: 12px; margin-top: 10px; }}
     .badge {{ display: inline-block; padding: 2px 8px; border: 1px solid #ccc; border-radius: 12px; font-size: 12px; margin-left: 8px; }}
+    .box {{
+      border: 1px solid #ddd; border-radius: 8px; padding: 8px;
+      max-height: 180px; overflow: auto; background: #fafafa;
+    }}
+    .box label {{ display: flex; gap: 8px; align-items: center; margin: 2px 0; font-size: 12px; color: #222; }}
+    .small {{ font-size: 12px; color: #666; margin-top: 4px; }}
+    .wide {{ min-width: 360px; }}
+    .btnrow {{ display: flex; gap: 8px; margin-top: 6px; }}
+    button {{ padding: 6px 10px; cursor: pointer; }}
   </style>
 </head>
 <body>
@@ -368,22 +366,42 @@ def build_interactive_html(df_history: pd.DataFrame, changes: pd.DataFrame, out_
     </div>
 
     <div class="control">
-      <label>{SEC1_COL} (optional filter)</label>
-      <select id="sec1Select"><option value="">(all)</option></select>
+      <label>{SEC1_COL} (multi-select)</label>
+      <div class="btnrow">
+        <button type="button" id="sec1All">All</button>
+        <button type="button" id="sec1None">None</button>
+      </div>
+      <div id="sec1Box" class="box"></div>
+      <div class="small">Checked = included. None checked means “all”.</div>
     </div>
 
     <div class="control">
-      <label>{SEC2_COL} (optional filter)</label>
-      <select id="sec2Select"><option value="">(all)</option></select>
+      <label>{SEC2_COL} (multi-select)</label>
+      <div class="btnrow">
+        <button type="button" id="sec2All">All</button>
+        <button type="button" id="sec2None">None</button>
+      </div>
+      <div id="sec2Box" class="box"></div>
+      <div class="small">Checked = included. None checked means “all”.</div>
     </div>
 
     <div class="control">
-      <label>{SEC3_COL} (optional filter)</label>
-      <select id="sec3Select"><option value="">(all)</option></select>
+      <label>{SEC3_COL} (multi-select)</label>
+      <div class="btnrow">
+        <button type="button" id="sec3All">All</button>
+        <button type="button" id="sec3None">None</button>
+      </div>
+      <div id="sec3Box" class="box"></div>
+      <div class="small">Checked = included. None checked means “all”.</div>
     </div>
 
-    <div class="control" style="min-width: 360px;">
-      <label>Security (filtered)</label>
+    <div class="control wide">
+      <label>Security (type to search)</label>
+      <input id="securityInput" list="securityDatalist" placeholder="Start typing Security..." />
+      <datalist id="securityDatalist"></datalist>
+      <div class="small">Pick from list or type exact Security; chart uses current selection below.</div>
+
+      <label style="margin-top:10px;">Security (filtered list)</label>
       <select id="securitySelect"></select>
     </div>
   </div>
@@ -403,19 +421,24 @@ const DATA = {json.dumps(payload)};
 
 const monthSelect = document.getElementById("monthSelect");
 const typeSelect = document.getElementById("typeSelect");
-const sec1Select = document.getElementById("sec1Select");
-const sec2Select = document.getElementById("sec2Select");
-const sec3Select = document.getElementById("sec3Select");
+
+const sec1Box = document.getElementById("sec1Box");
+const sec2Box = document.getElementById("sec2Box");
+const sec3Box = document.getElementById("sec3Box");
+
+const sec1AllBtn = document.getElementById("sec1All");
+const sec1NoneBtn = document.getElementById("sec1None");
+const sec2AllBtn = document.getElementById("sec2All");
+const sec2NoneBtn = document.getElementById("sec2None");
+const sec3AllBtn = document.getElementById("sec3All");
+const sec3NoneBtn = document.getElementById("sec3None");
+
+const securityInput = document.getElementById("securityInput");
+const securityDatalist = document.getElementById("securityDatalist");
 const securitySelect = document.getElementById("securitySelect");
 
-function setOptions(selectEl, values, includeBlank=false, blankLabel="(all)") {{
+function setOptions(selectEl, values) {{
   selectEl.innerHTML = "";
-  if (includeBlank) {{
-    const opt = document.createElement("option");
-    opt.value = "";
-    opt.textContent = blankLabel;
-    selectEl.appendChild(opt);
-  }}
   for (const v of values) {{
     const opt = document.createElement("option");
     opt.value = v;
@@ -424,14 +447,56 @@ function setOptions(selectEl, values, includeBlank=false, blankLabel="(all)") {{
   }}
 }}
 
-setOptions(monthSelect, DATA.months);
-setOptions(sec1Select, DATA.sec1_opts, true);
-setOptions(sec2Select, DATA.sec2_opts, true);
-setOptions(sec3Select, DATA.sec3_opts, true);
+function fillMonth() {{
+  setOptions(monthSelect, DATA.months);
+}}
+
+fillMonth();
 
 const metaBySecurity = new Map();
 for (const row of DATA.meta_rows) {{
   metaBySecurity.set(row.Security, row);
+}}
+
+function buildChecklist(container, values, groupName) {{
+  container.innerHTML = "";
+  for (const v of values) {{
+    const id = groupName + "_" + String(v).replace(/[^a-zA-Z0-9]/g, "_");
+    const wrap = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = v;
+    cb.dataset.group = groupName;
+    cb.addEventListener("change", refreshSecurityList);
+    wrap.appendChild(cb);
+    const t = document.createElement("span");
+    t.textContent = v;
+    wrap.appendChild(t);
+    container.appendChild(wrap);
+  }}
+}}
+
+buildChecklist(sec1Box, DATA.sec1_opts, "sec1");
+buildChecklist(sec2Box, DATA.sec2_opts, "sec2");
+buildChecklist(sec3Box, DATA.sec3_opts, "sec3");
+
+function setAll(container, checked) {{
+  const boxes = container.querySelectorAll("input[type=checkbox]");
+  boxes.forEach(cb => cb.checked = checked);
+}}
+
+sec1AllBtn.addEventListener("click", () => {{ setAll(sec1Box, true); refreshSecurityList(); }});
+sec1NoneBtn.addEventListener("click", () => {{ setAll(sec1Box, false); refreshSecurityList(); }});
+sec2AllBtn.addEventListener("click", () => {{ setAll(sec2Box, true); refreshSecurityList(); }});
+sec2NoneBtn.addEventListener("click", () => {{ setAll(sec2Box, false); refreshSecurityList(); }});
+sec3AllBtn.addEventListener("click", () => {{ setAll(sec3Box, true); refreshSecurityList(); }});
+sec3NoneBtn.addEventListener("click", () => {{ setAll(sec3Box, false); refreshSecurityList(); }});
+
+function selectedValues(container) {{
+  const boxes = Array.from(container.querySelectorAll("input[type=checkbox]"));
+  const checked = boxes.filter(cb => cb.checked).map(cb => cb.value);
+  // None checked => treat as "all"
+  return checked;
 }}
 
 function eligibleSecuritiesByMonthType(month, changeType) {{
@@ -442,7 +507,7 @@ function eligibleSecuritiesByMonthType(month, changeType) {{
 
   const secSet = new Set();
 
-  // "ALL" means: any month, but still respect Change Type
+  // "ALL" means any month, but still respect Change Type
   if (month === "ALL") {{
     for (const row of DATA.bucket_rows) {{
       if (row.Change_Type === changeType) {{
@@ -452,7 +517,6 @@ function eligibleSecuritiesByMonthType(month, changeType) {{
     return Array.from(secSet);
   }}
 
-  // Normal month filtering
   for (const row of DATA.bucket_rows) {{
     if (row.YearMonth === month && row.Change_Type === changeType) {{
       secSet.add(row.Security);
@@ -462,18 +526,46 @@ function eligibleSecuritiesByMonthType(month, changeType) {{
 }}
 
 function applySecFilters(securities) {{
-  const f1 = sec1Select.value;
-  const f2 = sec2Select.value;
-  const f3 = sec3Select.value;
+  const f1 = selectedValues(sec1Box);
+  const f2 = selectedValues(sec2Box);
+  const f3 = selectedValues(sec3Box);
+
+  const use1 = f1.length > 0;
+  const use2 = f2.length > 0;
+  const use3 = f3.length > 0;
 
   return securities.filter(sec => {{
     const metaRow = metaBySecurity.get(sec);
     if (!metaRow) return false;
-    if (f1 && String(metaRow["{SEC1_COL}"]) !== f1) return false;
-    if (f2 && String(metaRow["{SEC2_COL}"]) !== f2) return false;
-    if (f3 && String(metaRow["{SEC3_COL}"]) !== f3) return false;
+
+    const v1 = String(metaRow["{SEC1_COL}"]);
+    const v2 = String(metaRow["{SEC2_COL}"]);
+    const v3 = String(metaRow["{SEC3_COL}"]);
+
+    if (use1 && !f1.includes(v1)) return false;
+    if (use2 && !f2.includes(v2)) return false;
+    if (use3 && !f3.includes(v3)) return false;
     return true;
   }});
+}}
+
+function refreshDatalist(secs) {{
+  securityDatalist.innerHTML = "";
+  for (const s of secs) {{
+    const opt = document.createElement("option");
+    opt.value = s;
+    securityDatalist.appendChild(opt);
+  }}
+}}
+
+function syncSelectToInputIfPossible() {{
+  const typed = securityInput.value;
+  if (!typed) return;
+  const options = Array.from(securitySelect.options).map(o => o.value);
+  if (options.includes(typed)) {{
+    securitySelect.value = typed;
+    renderChart();
+  }}
 }}
 
 function refreshSecurityList() {{
@@ -484,6 +576,7 @@ function refreshSecurityList() {{
   secs = applySecFilters(secs).sort();
 
   setOptions(securitySelect, secs);
+  refreshDatalist(secs);
 
   if (secs.length === 0) {{
     Plotly.purge("chart");
@@ -491,9 +584,18 @@ function refreshSecurityList() {{
     return;
   }}
 
-  if (!securitySelect.value || !secs.includes(securitySelect.value)) {{
+  // keep current selection if possible
+  const current = securitySelect.value;
+  if (!current || !secs.includes(current)) {{
     securitySelect.value = secs[0];
   }}
+
+  // If user typed something valid, prefer it
+  const typed = securityInput.value;
+  if (typed && secs.includes(typed)) {{
+    securitySelect.value = typed;
+  }}
+
   renderChart();
 }}
 
@@ -539,12 +641,25 @@ function renderChart() {{
 
 monthSelect.addEventListener("change", refreshSecurityList);
 typeSelect.addEventListener("change", refreshSecurityList);
-sec1Select.addEventListener("change", refreshSecurityList);
-sec2Select.addEventListener("change", refreshSecurityList);
-sec3Select.addEventListener("change", refreshSecurityList);
-securitySelect.addEventListener("change", renderChart);
 
+// Security type-in behavior
+securityInput.addEventListener("change", () => {{
+  // If typed matches, select it
+  syncSelectToInputIfPossible();
+}});
+securityInput.addEventListener("keyup", () => {{
+  // live sync when it becomes exact match
+  syncSelectToInputIfPossible();
+}});
+
+securitySelect.addEventListener("change", () => {{
+  securityInput.value = securitySelect.value; // keep input in sync
+  renderChart();
+}});
+
+// Initial load
 refreshSecurityList();
+securityInput.value = securitySelect.value;
 </script>
 </body>
 </html>
