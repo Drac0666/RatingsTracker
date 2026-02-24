@@ -14,12 +14,19 @@ Usage:
                                 [--log-file tracker.log]
                                 [--verbose] [--dry-run]
 
-Fixes included:
-- HTML Security list no longer "empty" when CHANGES is empty or filters yield no change rows:
-  it falls back to HISTORY to populate securities.
-- Y-axis in Plotly chart shows rating LETTERS (from rating map) for 1..22 plus NR/PIF for 23/24.
-- NEW: If a rating agency series for a security has ALL non-null points == 23 (Not Rated),
-  it is automatically hidden (not plotted) for that security view.
+Includes:
+- Excel outputs: rating_history, all_changes, upgrades, downgrades, summary
+- HTML dashboard: dark theme, month/year filter (with ALL), change type filter,
+  SEC1/SEC2/SEC3 multi-select checkboxes, Security type-to-search, Plotly chart, changes table, CSV export.
+- Y-axis shows rating letters using RatingMapNew.xlsx, plus NR/PIF for 23/24.
+- Auto-hide agency series when ALL non-null points are Not Rated (23).
+
+Bug fix (this version):
+- When Month != ALL AND ChangeType is UPGRADE/DOWNGRADE, the security list now ONLY shows
+  securities that actually have matching change events. No “history fallback” in that case.
+  Fallback to history happens ONLY when:
+    (a) CHANGES is empty overall, OR
+    (b) ChangeType == ANY (user is exploring history even without change events).
 """
 
 import argparse
@@ -298,7 +305,6 @@ def detect_changes(history: pd.DataFrame) -> pd.DataFrame:
 
     for col in RATING_COLS:
         grp = df.groupby("Security", sort=False)
-
         before = grp[col].shift(1)
         after = df[col]
 
@@ -322,8 +328,7 @@ def detect_changes(history: pd.DataFrame) -> pd.DataFrame:
                     return "UPGRADE", 1
                 elif ai < bi:
                     return "DOWNGRADE", -1
-                else:
-                    return None, None
+                return None, None
             return "NON_COMPARABLE", None
 
         results = sub.apply(classify, axis=1)
@@ -377,12 +382,11 @@ def detect_changes(history: pd.DataFrame) -> pd.DataFrame:
             ]
         )
 
-    changes = (
+    return (
         pd.concat(records, ignore_index=True)
         .sort_values(["Security", "As_of_Date", "Agency_Column"])
         .reset_index(drop=True)
     )
-    return changes
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +425,7 @@ def build_summary(history: pd.DataFrame, changes: pd.DataFrame) -> pd.DataFrame:
         cols.append("Description")
     cols += RATING_COLS
 
-    summary = (
+    return (
         latest[cols]
         .join(first_date, on="Security")
         .join(last_date, on="Security")
@@ -429,8 +433,8 @@ def build_summary(history: pd.DataFrame, changes: pd.DataFrame) -> pd.DataFrame:
         .join(chg_counts, on="Security")
         .join(last_change, on="Security")
         .fillna({"Total_Upgrades": 0, "Total_Downgrades": 0, "Total_NonComparable": 0})
+        .reset_index(drop=True)
     )
-    return summary.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +578,6 @@ def build_html(
     history_sub = history[hist_cols].copy() if not history.empty else pd.DataFrame(columns=hist_cols)
     if "As_of_Date" in history_sub.columns:
         history_sub["As_of_Date"] = pd.to_datetime(history_sub["As_of_Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-
     if desc_col and desc_col != "Description" and "Description" not in history_sub.columns:
         history_sub = history_sub.rename(columns={desc_col: "Description"})
 
@@ -585,18 +588,14 @@ def build_html(
     history_json = _records_to_json(history_sub)
     changes_json = _records_to_json(changes_sub)
 
-    _grp: dict = defaultdict(list)
-    if not history.empty:
-        for d in history["As_of_Date"].dropna():
-            ts = pd.Timestamp(d)
-            _grp[ts.strftime("%Y-%m")].append(ts.strftime("%Y-%m-%d"))
-    year_months_grouped = {k: sorted(set(v)) for k, v in sorted(_grp.items())}
+    # Month buckets (YYYY-MM)
+    months = sorted(history["As_of_Date"].dropna().dt.strftime("%Y-%m").unique().tolist()) if not history.empty else []
+    months_json = json.dumps(months)
 
     sec1_vals = sorted(history["SEC 1"].dropna().astype(str).unique().tolist()) if not history.empty else []
     sec2_vals = sorted(history["SEC 2"].dropna().astype(str).unique().tolist()) if not history.empty else []
     sec3_vals = sorted(history["SEC 3"].dropna().astype(str).unique().tolist()) if not history.empty else []
 
-    year_months_json = json.dumps(year_months_grouped)
     sec1_json = json.dumps(sec1_vals)
     sec2_json = json.dumps(sec2_vals)
     sec3_json = json.dumps(sec3_vals)
@@ -643,12 +642,6 @@ def build_html(
     padding:3px 10px; font-size:.75rem; cursor:pointer; transition:all .12s;
   }}
   .btn-sm:hover {{ background:#162040; color:#38c9ff; border-color:#38c9ff; }}
-  .copy-btn {{
-    background:#0d1833; color:#7090c0; border:1px solid #2a3d6a; border-radius:4px;
-    padding:4px 10px; font-size:.78rem; cursor:pointer; transition:all .15s; white-space:nowrap;
-  }}
-  .copy-btn:hover  {{ background:#162040; color:#38c9ff; border-color:#38c9ff; }}
-  .copy-btn.copied {{ background:#1a4a2a; color:#50ff90; border-color:#50ff90; }}
   .export-btn {{
     background:#0d1833; color:#a0c070; border:1px solid #3a5020; border-radius:4px;
     padding:5px 14px; font-size:.82rem; cursor:pointer; transition:all .15s; white-space:nowrap;
@@ -698,7 +691,7 @@ def build_html(
 
 <div class="filter-panel">
   <div class="ctrl">
-    <span class="ctrl-label">Period (Month / Date)</span>
+    <span class="ctrl-label">Period (Month)</span>
     <select id="monthSel" style="min-width:160px"><option value="ALL">ALL</option></select>
   </div>
   <div class="ctrl">
@@ -766,7 +759,7 @@ def build_html(
 <script>
 const HISTORY  = {history_json};
 const CHANGES  = {changes_json};
-const YEAR_MONTHS_GROUPED = {year_months_json};
+const MONTHS   = {months_json};
 const SEC1_VALS = {sec1_json};
 const SEC2_VALS = {sec2_json};
 const SEC3_VALS = {sec3_json};
@@ -781,15 +774,12 @@ for (const s of Object.keys(histBySec))
   histBySec[s].sort((a,b) => String(a.As_of_Date).localeCompare(String(b.As_of_Date)));
 
 const monthSel = document.getElementById('monthSel');
-for (const [ym, days] of Object.entries(YEAR_MONTHS_GROUPED)) {{
-  const grpOpt = document.createElement('option');
-  grpOpt.value = ym; grpOpt.textContent = '📅 ' + ym;
-  grpOpt.style.fontWeight = 'bold'; grpOpt.style.color = '#38c9ff';
-  monthSel.appendChild(grpOpt);
+for (const m of MONTHS) {{
+  const o = document.createElement('option');
+  o.value = m; o.textContent = m;
+  monthSel.appendChild(o);
 }}
-/* keep "ALL" + month buckets (YYYY-MM). */
 
-/* Checkbox groups */
 function buildCheckboxGroup(groupId, vals) {{
   const g = document.getElementById(groupId);
   g.innerHTML = '';
@@ -811,19 +801,15 @@ function getChecked(id) {{
 function checkAll(id)  {{ document.querySelectorAll('#'+id+' input').forEach(c=>{{c.checked=true;}});  onFilterChange(); }}
 function checkNone(id) {{ document.querySelectorAll('#'+id+' input').forEach(c=>{{c.checked=false;}}); onFilterChange(); }}
 
-/* Fixed filtering logic */
+/* =========================
+   FILTERING (BUGFIXED)
+   ========================= */
 function getFilteredSecurities() {{
-  const month  = monthSel.value;
-  const chgTyp = document.getElementById('changeTypeSel').value;
+  const month  = monthSel.value; // 'ALL' or 'YYYY-MM'
+  const chgTyp = document.getElementById('changeTypeSel').value; // ANY/UPGRADE/DOWNGRADE
   const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
 
-  function historyMatchesPeriod(rows) {{
-    if (month === 'ALL') return rows.length > 0;
-    // month is YYYY-MM
-    return rows.some(r => String(r.As_of_Date || '').startsWith(month));
-  }}
-
-  function historyMatchesSecFilters(rows) {{
+  function secFiltersMatchHistory(rows) {{
     return rows.some(r =>
       (!s1.length || s1.includes(String(r['SEC 1']))) &&
       (!s2.length || s2.includes(String(r['SEC 2']))) &&
@@ -831,23 +817,38 @@ function getFilteredSecurities() {{
     );
   }}
 
+  // Changes that match period + type
   const filteredChanges = CHANGES.filter(c => {{
     if (month !== 'ALL' && c.YearMonth !== month) return false;
     if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
     return true;
   }});
 
+  const changesExistOverall = CHANGES.length > 0;
+
+  // IMPORTANT FIX:
+  // - If user selected UPGRADE/DOWNGRADE, we should ONLY list securities with matching change events.
+  //   No fallback-to-history when filteredChanges is empty.
+  // - Fallback to history is allowed only when:
+  //     a) there are NO changes at all in the dataset, OR
+  //     b) ChangeType == ANY (user just wants to browse history even without changes)
   if (filteredChanges.length === 0) {{
-    return Object.keys(histBySec).filter(sec => {{
-      const rows = histBySec[sec] || [];
-      return historyMatchesPeriod(rows) && historyMatchesSecFilters(rows);
-    }}).sort();
+    if (!changesExistOverall || chgTyp === 'ANY') {{
+      return Object.keys(histBySec).filter(sec => {{
+        const rows = histBySec[sec] || [];
+        if (rows.length === 0) return false;
+        if (month !== 'ALL' && !rows.some(r => String(r.As_of_Date||'').startsWith(month))) return false;
+        return secFiltersMatchHistory(rows);
+      }}).sort();
+    }}
+    return []; // strict: no matching change events for UPGRADE/DOWNGRADE
   }}
 
+  // Otherwise: securities from change events (and SEC filters checked against history)
   const secSet = new Set(filteredChanges.map(c => c.Security));
   return [...secSet].filter(sec => {{
     const rows = histBySec[sec] || [];
-    return historyMatchesSecFilters(rows);
+    return rows.length > 0 && secFiltersMatchHistory(rows);
   }}).sort();
 }}
 
@@ -888,10 +889,17 @@ function onFilterChange() {{
   const secs = getFilteredSecurities();
   populateSecList(secs);
 
+  const month  = monthSel.value;
+  const chgTyp = document.getElementById('changeTypeSel').value;
+
   document.getElementById('infoBar').textContent =
     secs.length
       ? (secs.length + ' securities match current filters. Select one to view its chart.')
-      : 'No securities match the current filters (try Month=ALL, Change Type=ANY, and wider SEC filters).';
+      : (
+          (chgTyp === 'ANY')
+            ? 'No securities match the current filters (try Month=ALL and wider SEC filters).'
+            : ('No securities have ' + chgTyp + ' events in ' + (month === 'ALL' ? 'ALL months' : month) + ' with the current SEC filters.')
+        );
 
   const cur = secSearch.value.trim();
   if (cur && !secs.includes(cur)) {{
@@ -921,27 +929,25 @@ function ratingLabel(v) {{
   if (v === null || v === undefined) return 'N/A';
   const letter = RATING_MAP[String(Math.round(v))];
   if (letter) return letter;
-  if (v === 23) return 'NR';
-  if (v === 24) return 'PIF';
+  if (Number(v) === 23) return 'NR';
+  if (Number(v) === 24) return 'PIF';
   return String(Math.round(v));
 }}
 
 function buildYAxisTicks() {{
   const vals = [];
   const labels = [];
-
   for (let i = 1; i <= 22; i++) {{
     vals.push(i);
     labels.push(RATING_MAP[String(i)] || String(i));
   }}
   vals.push(23); labels.push("NR");
   vals.push(24); labels.push("PIF");
-
   return {{ tickvals: vals, ticktext: labels }};
 }}
 const Y_TICKS = buildYAxisTicks();
 
-/* Chart (with auto-hide if ALL points are Not Rated == 23) */
+/* Auto-hide agency series when all non-null points are NR (23) */
 function drawChart(security) {{
   const rows = histBySec[security] || [];
   if (!rows.length) return;
@@ -950,21 +956,16 @@ function drawChart(security) {{
   for (const col of RATING_COLS) {{
     const x = [], y = [], txt = [];
     const nonNullY = [];
-
     for (const r of rows) {{
       const v = r[col];
       if (v === null || v === undefined) continue;
       nonNullY.push(v);
       x.push(r.As_of_Date); y.push(v); txt.push(ratingLabel(v));
     }}
-
-    // NEW: hide entire series when ALL non-null points are NR (23)
     if (nonNullY.length > 0) {{
       const allNR = nonNullY.every(v => Number(v) === 23);
       if (allNR) continue;
     }}
-
-    // If the series has no points at all, don't plot it either
     if (y.length === 0) continue;
 
     traces.push({{
@@ -1024,7 +1025,6 @@ function drawChart(security) {{
   const chartDiv = document.getElementById('chartDiv');
   chartDiv.style.display = '';
 
-  // If all agencies were hidden, show a message instead of blank plot
   if (traces.length === 0) {{
     Plotly.purge(chartDiv);
     chartDiv.innerHTML = "<div style='color:#6070a0;padding:30px;text-align:center'>All rating agency series are Not Rated (NR) for this security, so they were hidden.</div>";
@@ -1119,9 +1119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sheet", default=0, help="Sheet name or zero-based index to read.")
     parser.add_argument("--out-xlsx", default="SF_Rating_Tracking_Output.xlsx", help="Output Excel workbook path.")
     parser.add_argument("--out-html", default="SF_Rating_Tracking_Interactive.html", help="Output HTML dashboard path.")
-    parser.add_argument(
-        "--rating-map", default="RatingMapNew.xlsx", help="Excel/CSV with 'Number #' and 'Final Rating'."
-    )
+    parser.add_argument("--rating-map", default="RatingMapNew.xlsx", help="Excel/CSV with 'Number #' and 'Final Rating'.")
     parser.add_argument("--since", default=None, help="Only include data on or after this date (YYYY-MM-DD).")
     parser.add_argument("--max-html-securities", default=500, type=int, help="Cap number of securities embedded in HTML.")
     parser.add_argument("--log-file", default=None, help="Write log output to this file in addition to stdout.")
