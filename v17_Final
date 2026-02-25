@@ -168,10 +168,6 @@ def _build_column_map(raw_cols: list) -> dict:
         # Optional extra columns
         "description": "Description", "desc": "Description", "name": "Description",
         "security name": "Description", "bond name": "Description",
-        "group description": "Group_Description", "group_description": "Group_Description",
-        "grp description": "Group_Description", "grp_description": "Group_Description",
-        "group desc": "Group_Description", "grp desc": "Group_Description",
-        "groupdescription": "Group_Description",
     })
     return {raw: lookup[_normalise_key(raw)] for raw in raw_cols if _normalise_key(raw) in lookup}
 
@@ -183,7 +179,7 @@ def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns after normalisation: {missing}")
-    extra = [c for c in ["Description", "Group_Description"] if c in df.columns]
+    extra = [c for c in ["Description"] if c in df.columns]
     return df[CANONICAL_COLUMNS + extra]
 
 
@@ -532,13 +528,13 @@ def build_html(
         history = history[history["Security"].isin(kept_secs)].copy()
         changes = changes[changes["Security"].isin(kept_secs)].copy()
 
-    desc_col    = next((c for c in history.columns if c.strip().lower() == "description"),       None)
-    grpdesc_col = next((c for c in history.columns if c.strip().lower() == "group_description"), None)
-    extra_cols  = [c for c in [desc_col, grpdesc_col] if c]
-    hist_cols   = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3"] + extra_cols + RATING_COLS
+    desc_col  = next((c for c in history.columns if c.strip().lower() == "description"), None)
+    hist_cols = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3"] + RATING_COLS
+    if desc_col:
+        hist_cols = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3", desc_col] + RATING_COLS
     history_sub = history[hist_cols].copy()
-    if desc_col    and desc_col    != "Description":       history_sub = history_sub.rename(columns={desc_col:    "Description"})
-    if grpdesc_col and grpdesc_col != "Group_Description": history_sub = history_sub.rename(columns={grpdesc_col: "Group_Description"})
+    if desc_col and desc_col != "Description":
+        history_sub = history_sub.rename(columns={desc_col: "Description"})
     history_sub["As_of_Date"] = history_sub["As_of_Date"].dt.strftime("%Y-%m-%d")
 
     changes_sub = changes.copy()
@@ -564,16 +560,6 @@ def build_html(
     sec2_json        = json.dumps([str(v) for v in sec2_vals])
     sec3_json        = json.dumps([str(v) for v in sec3_vals])
     rating_map_json  = json.dumps({str(k): v for k, v in rating_map.items()})
-    # Build {Security: Group_Description} lookup for MMM Only filter
-    if "Group_Description" in history_sub.columns:
-        _grpdesc = (
-            history_sub[["Security","Group_Description"]].dropna(subset=["Group_Description"])
-            .drop_duplicates("Security").set_index("Security")["Group_Description"]
-            .to_dict()
-        )
-    else:
-        _grpdesc = {}
-    grpdesc_json = json.dumps({k: str(v) for k, v in _grpdesc.items()})
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -717,14 +703,7 @@ def build_html(
       <option value="DOWNGRADE">DOWNGRADE</option>
     </select>
   </div>
-  <div class="ctrl" style="justify-content:flex-end">
-    <span class="ctrl-label">Special</span>
-    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:7px 12px;background:#0d1833;border:1px solid #2a3d6a;border-radius:5px;white-space:nowrap;transition:all .15s">
-      <input type="checkbox" id="mmmOnly" style="accent-color:#38c9ff;width:15px;height:15px;cursor:pointer"/>
-      <span style="color:#d0d8f0;font-size:.88rem;font-weight:600">MMM Only</span>
-      <span style="font-size:.72rem;color:#6070a0">(Group &#8839; 021)</span>
-    </label>
-  </div>
+
   <div class="ctrl">
     <span class="ctrl-label">SEC 1</span>
     <div class="cb-group-wrap">
@@ -797,7 +776,6 @@ const SEC2_VALS = {sec2_json};
 const SEC3_VALS = {sec3_json};
 const RATING_COLS  = ["RTG_FITCH_MAPPED","RTG_MOODY_MAPPED","RTG_SP_MAPPED","RTG_DBRS_MAPPED"];
 const RATING_MAP   = {rating_map_json};
-const GRPDESC      = {grpdesc_json};
 
 /* ================================================================
    Indexes
@@ -859,39 +837,19 @@ function checkNone(id) {{ document.querySelectorAll('#'+id+' input').forEach(c=>
    Filtering
    ================================================================ */
 function getFilteredSecurities() {{
-  const month   = monthSel.value;
-  const chgTyp  = document.getElementById('changeTypeSel').value;
-  const mmmOnly = document.getElementById('mmmOnly').checked;
+  const month  = monthSel.value;
+  const chgTyp = document.getElementById('changeTypeSel').value;
   const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
 
-  /* When MMM Only is on: start from ALL securities in HISTORY that contain
-     "021" in Group_Description, then optionally narrow by period/change type.
-     When MMM Only is off: keep existing behaviour (only secs that have changes). */
-  let secSet;
-  if (mmmOnly) {{
-    /* Universe = every security in HISTORY whose Group_Description includes "021" */
-    secSet = new Set(
-      Object.keys(histBySec).filter(sec => (GRPDESC[sec] || '').includes('021'))
-    );
-    /* Then narrow by period / change type if they are active */
-    if (month !== 'ALL' || chgTyp !== 'ANY') {{
-      const filtered = CHANGES.filter(c => {{
-        if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
-        if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
-        return true;
-      }});
-      const changedSecs = new Set(filtered.map(c => c.Security));
-      secSet = new Set([...secSet].filter(s => changedSecs.has(s)));
+  const filtered = CHANGES.filter(c => {{
+    if (month !== 'ALL') {{
+      if (c.As_of_Date !== month && c.YearMonth !== month) return false;
     }}
-  }} else {{
-    const filtered = CHANGES.filter(c => {{
-      if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
-      if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
-      return true;
-    }});
-    secSet = new Set(filtered.map(c => c.Security));
-  }}
+    if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+    return true;
+  }});
 
+  const secSet = new Set(filtered.map(c => c.Security));
   return [...secSet].filter(sec => {{
     const rows = histBySec[sec] || [];
     return rows.some(r =>
@@ -981,7 +939,6 @@ function toggleFilterPanel() {{
 }}
 monthSel.addEventListener('change', onFilterChange);
 document.getElementById('changeTypeSel').addEventListener('change', onFilterChange);
-document.getElementById('mmmOnly').addEventListener('change', onFilterChange);
 
 /* ================================================================
    Rating helpers
