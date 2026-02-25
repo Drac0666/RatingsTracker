@@ -1,0 +1,1360 @@
+"""
+SF Rating Tracking Script
+Processes all Excel files matching SF*.xlsx, detects rating changes,
+and produces an Excel workbook + interactive HTML dashboard.
+
+Usage:
+    python sf_rating_tracker.py [--pattern SF*.xlsx] [--sheet 0]
+                                [--out-xlsx SF_Rating_Tracking_Output.xlsx]
+                                [--out-html SF_Rating_Tracking_Interactive.html]
+                                [--rating-map RatingMapNew.xlsx]
+                                [--since YYYY-MM-DD]
+                                [--max-html-securities 500]
+                                [--log-file tracker.log]
+                                [--verbose] [--dry-run]
+
+Improvements applied (v2):
+  #1  Vectorised change detection (groupby+shift, no iterrows)
+  #2  --max-html-securities guard to prevent giant HTML files
+  #3  --dry-run flag (shows what would be processed, writes nothing)
+  #4  logging module with --verbose / --log-file support
+  #5  Description column standardised via column alias table
+  #6  Summary sheet in Excel (latest ratings + change totals per security)
+  #7  Export-filtered-CSV button in the HTML dashboard
+  #8  Change annotations (vertical lines) on the chart
+  #9  Changes table rendered below the chart in HTML
+  #10 --since YYYY-MM-DD flag to filter history to a start date
+"""
+
+import argparse
+import glob
+import json
+import logging
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------------
+# Logging setup  (#4)
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger("sf_tracker")
+
+
+def _setup_logging(verbose: bool, log_file: Optional[str]) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt   = "%(asctime)s  %(levelname)-8s  %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers: list = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+CANONICAL_COLUMNS = [
+    "As_of_Date",
+    "Security",
+    "SEC 1",
+    "SEC 2",
+    "SEC 3",
+    "RTG_FITCH_MAPPED",
+    "RTG_MOODY_MAPPED",
+    "RTG_SP_MAPPED",
+    "RTG_DBRS_MAPPED",
+]
+
+RATING_COLS = [
+    "RTG_FITCH_MAPPED",
+    "RTG_MOODY_MAPPED",
+    "RTG_SP_MAPPED",
+    "RTG_DBRS_MAPPED",
+]
+
+RATING_NOT_RATED = 23
+RATING_PIF       = 24
+COMPARABLE_MIN   = 1
+COMPARABLE_MAX   = 22
+
+
+# ---------------------------------------------------------------------------
+# Rating map loader  (#5 — Description also added to aliases below)
+# ---------------------------------------------------------------------------
+
+
+def load_rating_map(filepath: str) -> dict:
+    """Read RatingMapNew.xlsx → {int: str}.  Fuzzy-matches column names."""
+    if not filepath:
+        return {}
+    if not os.path.exists(filepath):
+        log.warning("Rating map file not found: %s", filepath)
+        return {}
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+        raw = pd.read_excel(filepath, dtype=str) if ext in (".xlsx", ".xls", ".xlsm") \
+              else pd.read_csv(filepath, dtype=str)
+        raw.columns = [str(c).strip() for c in raw.columns]
+
+        num_aliases   = {"number #", "number", "num", "#", "no", "no."}
+        label_aliases = {"final rating", "rating", "label", "final_rating"}
+
+        num_col = label_col = None
+        for c in raw.columns:
+            k = c.lower().strip()
+            if k in num_aliases   and num_col   is None: num_col   = c
+            if k in label_aliases and label_col is None: label_col = c
+
+        if num_col is None or label_col is None:
+            log.warning("Could not identify 'Number #' / 'Final Rating' columns in %s. Found: %s",
+                        filepath, list(raw.columns))
+            return {}
+
+        mapping: dict = {}
+        for _, row in raw.iterrows():
+            try:
+                k = int(float(str(row[num_col]).strip()))
+                v = str(row[label_col]).strip()
+                if v and v.lower() not in ("nan", "none", ""):
+                    mapping[k] = v
+            except (ValueError, TypeError):
+                continue
+
+        log.info("Rating map loaded from %s: %d entries", filepath, len(mapping))
+        return mapping
+    except Exception as exc:
+        log.warning("Failed to load rating map from %s: %s", filepath, exc)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Column normalisation  (#5 — Description alias added)
+# ---------------------------------------------------------------------------
+
+
+def _normalise_key(s: str) -> str:
+    s = str(s).strip().lower()
+    return re.sub(r"[\s_]+", " ", s)
+
+
+def _build_column_map(raw_cols: list) -> dict:
+    lookup: dict = {_normalise_key(c): c for c in CANONICAL_COLUMNS}
+    lookup.update({
+        "asofdate": "As_of_Date", "as of date": "As_of_Date",
+        "asof date": "As_of_Date", "date": "As_of_Date",
+        "security": "Security",
+        "sec1": "SEC 1", "sec2": "SEC 2", "sec3": "SEC 3",
+        "rtg fitch mapped": "RTG_FITCH_MAPPED",
+        "rtg moody mapped": "RTG_MOODY_MAPPED",
+        "rtg sp mapped":    "RTG_SP_MAPPED",
+        "rtg dbrs mapped":  "RTG_DBRS_MAPPED",
+        "rtg fitch": "RTG_FITCH_MAPPED", "rtg moody": "RTG_MOODY_MAPPED",
+        "rtg sp":    "RTG_SP_MAPPED",    "rtg dbrs":  "RTG_DBRS_MAPPED",
+        "fitch": "RTG_FITCH_MAPPED",
+        "moody": "RTG_MOODY_MAPPED", "moodys": "RTG_MOODY_MAPPED", "moody s": "RTG_MOODY_MAPPED",
+        "sp": "RTG_SP_MAPPED", "s p": "RTG_SP_MAPPED", "s&p": "RTG_SP_MAPPED",
+        "dbrs": "RTG_DBRS_MAPPED",
+        # Optional extra columns
+        "description": "Description", "desc": "Description", "name": "Description",
+        "security name": "Description", "bond name": "Description",
+        "group description": "Group_Description", "group_description": "Group_Description",
+        "grp description": "Group_Description", "grp_description": "Group_Description",
+        "group desc": "Group_Description", "grp desc": "Group_Description",
+        "groupdescription": "Group_Description",
+    })
+    return {raw: lookup[_normalise_key(raw)] for raw in raw_cols if _normalise_key(raw) in lookup}
+
+
+def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename to canonical names; keep Description if present; raise if required cols missing."""
+    col_map = _build_column_map(list(df.columns))
+    df = df.rename(columns=col_map)
+    missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns after normalisation: {missing}")
+    extra = [c for c in ["Description", "Group_Description"] if c in df.columns]
+    return df[CANONICAL_COLUMNS + extra]
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+
+def read_sf_files(pattern: str, sheet, since: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """Read + merge all matching Excel files.  Deduplicates by (Security, As_of_Date)."""
+    files = sorted(glob.glob(pattern))
+    if not files:
+        log.warning("No files matched pattern '%s'", pattern)
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+
+    frames: list = []
+    for fpath in files:
+        try:
+            raw = pd.read_excel(fpath, sheet_name=sheet, dtype=str)
+            raw.columns = [str(c) for c in raw.columns]
+            df = standardise_columns(raw)
+            df = df.copy()
+            df["_source_file"] = os.path.basename(fpath)
+            frames.append(df)
+            log.info("Read %s  (%d rows)", fpath, len(df))
+        except Exception as exc:
+            log.warning("Skipping %s: %s", fpath, exc)
+
+    if not frames:
+        return pd.DataFrame(columns=CANONICAL_COLUMNS)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["As_of_Date"] = pd.to_datetime(
+        combined["As_of_Date"], infer_datetime_format=True, errors="coerce"
+    ).dt.normalize()
+
+    for col in RATING_COLS:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
+
+    combined = (
+        combined.sort_values("_source_file")
+        .drop_duplicates(subset=["Security", "As_of_Date"], keep="last")
+        .drop(columns=["_source_file"])
+        .reset_index(drop=True)
+    )
+
+    # #10 — --since filter
+    if since is not None:
+        combined = combined[combined["As_of_Date"] >= since].reset_index(drop=True)
+        log.info("Applied --since %s: %d rows remain", since.date(), len(combined))
+
+    combined = combined.sort_values(["Security", "As_of_Date"]).reset_index(drop=True)
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Rating helpers
+# ---------------------------------------------------------------------------
+
+
+def _value_label(val) -> Optional[str]:
+    if pd.isna(val):
+        return None
+    v = int(val)
+    return "N/A" if v == RATING_NOT_RATED else "PIF" if v == RATING_PIF else None
+
+
+def _is_comparable(val) -> bool:
+    if pd.isna(val):
+        return False
+    return COMPARABLE_MIN <= int(val) <= COMPARABLE_MAX
+
+
+# ---------------------------------------------------------------------------
+# Change detection  (#1 — fully vectorised, no iterrows)
+# ---------------------------------------------------------------------------
+
+
+def detect_changes(history: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vectorised change detection using groupby + shift.
+    For each (Security, rating_col) pair emit a row on every value change.
+    """
+    if history.empty:
+        return pd.DataFrame(columns=[
+            "As_of_Date", "YearMonth", "Security",
+            "SEC 1", "SEC 2", "SEC 3",
+            "Agency_Column", "RTG_MAPPED_before", "RTG_MAPPED_after",
+            "Change_Type", "Direction", "Before_Label", "After_Label",
+        ])
+
+    df = history.sort_values(["Security", "As_of_Date"]).copy()
+    records: list = []
+
+    for col in RATING_COLS:
+        grp = df.groupby("Security", sort=False)
+
+        before = grp[col].shift(1)
+        after  = df[col]
+
+        # Mask: value actually changed (NaN→value, value→NaN, or numeric diff)
+        both_nan    = before.isna() & after.isna()
+        both_equal  = (~before.isna()) & (~after.isna()) & (before == after)
+        is_first    = grp[col].cumcount() == 0   # first row per security — no "before"
+        changed     = ~(both_nan | both_equal | is_first)
+
+        sub = df[changed].copy()
+        sub["_before"] = before[changed].values
+        sub["_after"]  = after[changed].values
+
+        if sub.empty:
+            continue
+
+        # Classify each changed row
+        def classify(row):
+            b, a = row["_before"], row["_after"]
+            if _is_comparable(b) and _is_comparable(a):
+                bi, ai = int(b), int(a)
+                if   ai > bi: return "UPGRADE",        1
+                elif ai < bi: return "DOWNGRADE",      -1
+                else:         return None,              None   # equal after int cast
+            return "NON_COMPARABLE", None
+
+        results = sub.apply(classify, axis=1)
+        sub["Change_Type"] = [r[0] for r in results]
+        sub["Direction"]   = [r[1] for r in results]
+        sub = sub[sub["Change_Type"].notna()].copy()
+
+        sub["Agency_Column"]    = col
+        sub["RTG_MAPPED_before"] = sub["_before"]
+        sub["RTG_MAPPED_after"]  = sub["_after"]
+        sub["Before_Label"]     = sub["_before"].map(_value_label)
+        sub["After_Label"]      = sub["_after"].map(_value_label)
+        sub["YearMonth"]        = sub["As_of_Date"].map(
+            lambda d: pd.Timestamp(d).strftime("%Y-%m") if not pd.isna(d) else None
+        )
+
+        records.append(sub[[
+            "As_of_Date", "YearMonth", "Security",
+            "SEC 1", "SEC 2", "SEC 3",
+            "Agency_Column", "RTG_MAPPED_before", "RTG_MAPPED_after",
+            "Change_Type", "Direction", "Before_Label", "After_Label",
+        ]])
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "As_of_Date", "YearMonth", "Security",
+            "SEC 1", "SEC 2", "SEC 3",
+            "Agency_Column", "RTG_MAPPED_before", "RTG_MAPPED_after",
+            "Change_Type", "Direction", "Before_Label", "After_Label",
+        ])
+
+    changes = (
+        pd.concat(records, ignore_index=True)
+        .sort_values(["Security", "As_of_Date", "Agency_Column"])
+        .reset_index(drop=True)
+    )
+    return changes
+
+
+# ---------------------------------------------------------------------------
+# Summary builder  (#6)
+# ---------------------------------------------------------------------------
+
+
+def build_summary(history: pd.DataFrame, changes: pd.DataFrame) -> pd.DataFrame:
+    """One row per Security: latest ratings, first/last date, change counts."""
+    if history.empty:
+        return pd.DataFrame()
+
+    latest = (
+        history.sort_values("As_of_Date")
+        .groupby("Security", sort=False)
+        .last()
+        .reset_index()
+    )
+    first_date = (
+        history.groupby("Security")["As_of_Date"].min().rename("First_Date")
+    )
+    last_date = (
+        history.groupby("Security")["As_of_Date"].max().rename("Last_Date")
+    )
+    obs_count = (
+        history.groupby("Security")["As_of_Date"].count().rename("Observations")
+    )
+
+    if not changes.empty:
+        chg_counts = changes.groupby(["Security", "Change_Type"]).size().unstack(fill_value=0)
+        for col in ("UPGRADE", "DOWNGRADE", "NON_COMPARABLE"):
+            if col not in chg_counts.columns:
+                chg_counts[col] = 0
+        chg_counts = chg_counts.rename(columns={
+            "UPGRADE": "Total_Upgrades",
+            "DOWNGRADE": "Total_Downgrades",
+            "NON_COMPARABLE": "Total_NonComparable",
+        })
+        last_change = (
+            changes.groupby("Security")["As_of_Date"].max().rename("Last_Change_Date")
+        )
+    else:
+        chg_counts = pd.DataFrame(
+            columns=["Total_Upgrades", "Total_Downgrades", "Total_NonComparable"]
+        )
+        last_change = pd.Series(dtype="datetime64[ns]", name="Last_Change_Date")
+
+    summary = (
+        latest[["Security", "SEC 1", "SEC 2", "SEC 3"]
+               + (["Description"] if "Description" in latest.columns else [])
+               + RATING_COLS]
+        .join(first_date,   on="Security")
+        .join(last_date,    on="Security")
+        .join(obs_count,    on="Security")
+        .join(chg_counts,   on="Security")
+        .join(last_change,  on="Security")
+        .fillna({"Total_Upgrades": 0, "Total_Downgrades": 0, "Total_NonComparable": 0})
+    )
+    return summary.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Excel output
+# ---------------------------------------------------------------------------
+
+
+def _apply_header_style(ws, n_cols: int) -> None:
+    fill   = PatternFill("solid", start_color="1F3864", end_color="1F3864")
+    font   = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin   = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for col_idx in range(1, n_cols + 1):
+        c = ws.cell(row=1, column=col_idx)
+        c.fill = fill; c.font = font; c.alignment = align; c.border = border
+    ws.row_dimensions[1].height = 28
+
+
+def _set_column_widths(ws) -> None:
+    for col in ws.columns:
+        letter = get_column_letter(col[0].column)
+        max_len = max(
+            (len(str(cell.value)) for cell in col if cell.value is not None), default=8
+        )
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 42)
+
+
+def _df_to_sheet(wb: Workbook, sheet_name: str, df: pd.DataFrame) -> None:
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(sheet_name)
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        ws.cell(row=1, column=col_idx, value=col_name)
+    _apply_header_style(ws, len(df.columns))
+
+    even_fill  = PatternFill("solid", start_color="DCE6F1", end_color="DCE6F1")
+    odd_fill   = PatternFill("solid", start_color="FFFFFF", end_color="FFFFFF")
+    data_font  = Font(name="Arial", size=10)
+    center     = Alignment(horizontal="center", vertical="center")
+
+    for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        fill = even_fill if row_idx % 2 == 0 else odd_fill
+        for col_idx, val in enumerate(row, start=1):
+            if isinstance(val, pd.Timestamp):             val = val.date()
+            elif isinstance(val, float) and np.isnan(val): val = None
+            elif isinstance(val, np.integer):              val = int(val)
+            elif isinstance(val, np.floating):             val = None if np.isnan(val) else float(val)
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill = fill; cell.font = data_font; cell.alignment = center
+
+    ws.freeze_panes = "A2"
+    _set_column_widths(ws)
+
+
+def write_excel(
+    history: pd.DataFrame, changes: pd.DataFrame, summary: pd.DataFrame, out_path: str
+) -> None:
+    wb = Workbook()
+    for name in list(wb.sheetnames):
+        del wb[name]
+
+    # Summary first (#6)
+    if not summary.empty:
+        _df_to_sheet(wb, "summary", summary)
+
+    hist_cols = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3"] + RATING_COLS
+    if "Description" in history.columns:
+        hist_cols = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3", "Description"] + RATING_COLS
+    _df_to_sheet(wb, "rating_history",  history[hist_cols])
+    _df_to_sheet(wb, "all_changes",     changes)
+    _df_to_sheet(wb, "downgrades",      changes[changes["Change_Type"] == "DOWNGRADE"].reset_index(drop=True))
+    _df_to_sheet(wb, "upgrades",        changes[changes["Change_Type"] == "UPGRADE"].reset_index(drop=True))
+
+    wb.save(out_path)
+    log.info("Excel saved: %s", out_path)
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
+
+
+def _records_to_json(df: pd.DataFrame) -> str:
+    tmp = df.copy()
+    for col in tmp.columns:
+        if pd.api.types.is_datetime64_any_dtype(tmp[col]):
+            tmp[col] = tmp[col].dt.strftime("%Y-%m-%d")
+    records = []
+    for row in tmp.to_dict(orient="records"):
+        clean: dict = {}
+        for k, v in row.items():
+            if   isinstance(v, float) and np.isnan(v):  clean[k] = None
+            elif isinstance(v, np.integer):               clean[k] = int(v)
+            elif isinstance(v, np.floating):              clean[k] = None if np.isnan(v) else float(v)
+            else:                                         clean[k] = v
+        records.append(clean)
+    return json.dumps(records, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Interactive HTML  (#2 #7 #8 #9)
+# ---------------------------------------------------------------------------
+
+
+def build_html(
+    history: pd.DataFrame,
+    changes: pd.DataFrame,
+    out_path: str,
+    rating_map: Optional[dict] = None,
+    max_securities: int = 500,
+) -> None:
+    """Generate a self-contained interactive HTML dashboard."""
+    rating_map = rating_map or {}
+
+    # #2 — guard against huge files
+    unique_secs = history["Security"].nunique()
+    if unique_secs > max_securities:
+        log.warning(
+            "History contains %d unique securities; capping HTML at %d "
+            "(use --max-html-securities to increase). "
+            "Extra securities will still appear in Excel.",
+            unique_secs, max_securities,
+        )
+        kept_secs = (
+            history.groupby("Security")["As_of_Date"].max()
+            .nlargest(max_securities).index
+        )
+        history = history[history["Security"].isin(kept_secs)].copy()
+        changes = changes[changes["Security"].isin(kept_secs)].copy()
+
+    desc_col    = next((c for c in history.columns if c.strip().lower() == "description"),       None)
+    grpdesc_col = next((c for c in history.columns if c.strip().lower() == "group_description"), None)
+    extra_cols  = [c for c in [desc_col, grpdesc_col] if c]
+    hist_cols   = ["As_of_Date", "Security", "SEC 1", "SEC 2", "SEC 3"] + extra_cols + RATING_COLS
+    history_sub = history[hist_cols].copy()
+    if desc_col    and desc_col    != "Description":       history_sub = history_sub.rename(columns={desc_col:    "Description"})
+    if grpdesc_col and grpdesc_col != "Group_Description": history_sub = history_sub.rename(columns={grpdesc_col: "Group_Description"})
+    history_sub["As_of_Date"] = history_sub["As_of_Date"].dt.strftime("%Y-%m-%d")
+
+    changes_sub = changes.copy()
+    changes_sub["As_of_Date"] = changes_sub["As_of_Date"].dt.strftime("%Y-%m-%d")
+
+    history_json = _records_to_json(history_sub)
+    changes_json = _records_to_json(changes_sub)
+
+    # Period dropdown grouped by month
+    from collections import defaultdict as _dd
+    _grp: dict = _dd(list)
+    for d in history["As_of_Date"].dropna():
+        ts = pd.Timestamp(d)
+        _grp[ts.strftime("%Y-%m")].append(ts.strftime("%Y-%m-%d"))
+    year_months_grouped = {k: sorted(set(v)) for k, v in sorted(_grp.items())}
+
+    sec1_vals = sorted(history["SEC 1"].dropna().unique().tolist())
+    sec2_vals = sorted(history["SEC 2"].dropna().unique().tolist())
+    sec3_vals = sorted(history["SEC 3"].dropna().unique().tolist())
+
+    year_months_json = json.dumps(year_months_grouped)
+    sec1_json        = json.dumps([str(v) for v in sec1_vals])
+    sec2_json        = json.dumps([str(v) for v in sec2_vals])
+    sec3_json        = json.dumps([str(v) for v in sec3_vals])
+    rating_map_json  = json.dumps({str(k): v for k, v in rating_map.items()})
+    # Build {Security: Group_Description} lookup for MMM Only filter
+    if "Group_Description" in history_sub.columns:
+        _grpdesc = (
+            history_sub[["Security","Group_Description"]].dropna(subset=["Group_Description"])
+            .drop_duplicates("Security").set_index("Security")["Group_Description"]
+            .to_dict()
+        )
+    else:
+        _grpdesc = {}
+    grpdesc_json = json.dumps({k: str(v) for k, v in _grpdesc.items()})
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SF Rating Tracking Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #12121f; color: #d0d0e8; font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; }}
+  header {{
+    padding: 14px 28px; background: linear-gradient(90deg,#0d0d1e,#162040);
+    border-bottom: 2px solid #1a4080; display: flex; align-items: center; gap: 12px;
+  }}
+  header h1 {{ font-size: 1.25rem; color: #38c9ff; letter-spacing:.04em; font-weight:700; }}
+  .filter-panel {{
+    display: flex; flex-wrap: wrap; gap: 20px; padding: 16px 28px;
+    background: #14142a; border-bottom: 1px solid #1e2d52; align-items: flex-start;
+  }}
+  .ctrl {{ display: flex; flex-direction: column; gap: 5px; }}
+  .ctrl-label {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.07em; color:#7080a0; font-weight:600; }}
+  select, input[type="text"] {{
+    background:#0d1833; color:#d0d8f0; border:1px solid #2a3d6a;
+    border-radius:5px; padding:6px 10px; font-size:.88rem; outline:none; transition:border-color .15s;
+  }}
+  select:focus, input[type="text"]:focus {{ border-color:#38c9ff; }}
+  .cb-group-wrap {{ display:flex; flex-direction:column; gap:4px; }}
+  .cb-group {{
+    background:#0d1833; border:1px solid #2a3d6a; border-radius:5px;
+    padding:6px 8px; max-height:138px; overflow-y:auto; min-width:130px;
+  }}
+  .cb-group::-webkit-scrollbar {{ width:5px; }}
+  .cb-group::-webkit-scrollbar-thumb {{ background:#2a3d6a; border-radius:3px; }}
+  .cb-group label {{ display:flex; align-items:center; gap:7px; padding:3px 5px; border-radius:3px; cursor:pointer; font-size:.85rem; }}
+  .cb-group label:hover {{ background:#162040; }}
+  .btn-row {{ display:flex; gap:6px; margin-top:3px; }}
+  .btn-sm {{
+    background:#0d1833; color:#7090c0; border:1px solid #2a3d6a; border-radius:4px;
+    padding:3px 10px; font-size:.75rem; cursor:pointer; transition:all .12s;
+  }}
+  .btn-sm:hover {{ background:#162040; color:#38c9ff; border-color:#38c9ff; }}
+  .copy-btn {{
+    background:#0d1833; color:#7090c0; border:1px solid #2a3d6a; border-radius:4px;
+    padding:4px 10px; font-size:.78rem; cursor:pointer; transition:all .15s; white-space:nowrap;
+  }}
+  .copy-btn:hover  {{ background:#162040; color:#38c9ff; border-color:#38c9ff; }}
+  .copy-btn.copied {{ background:#1a4a2a; color:#50ff90; border-color:#50ff90; }}
+  .export-btn {{
+    background:#0d1833; color:#a0c070; border:1px solid #3a5020; border-radius:4px;
+    padding:5px 14px; font-size:.82rem; cursor:pointer; transition:all .15s; white-space:nowrap;
+  }}
+  .export-btn:hover {{ background:#1a3010; color:#c0ff80; border-color:#60a030; }}
+  .sec-selector {{ display:flex; flex-direction:column; gap:5px; min-width:220px; }}
+  #secSearch {{ width:100%; }}
+  #secList {{
+    width:100%; height:138px; background:#0d1833;
+    border:1px solid #2a3d6a; border-radius:5px; color:#d0d8f0; font-size:.88rem;
+  }}
+  #secList option:checked {{ background:#1a4080; }}
+  .info-bar {{
+    padding:9px 28px; background:#10102a; color:#6070a0; font-size:.8rem;
+    border-bottom:1px solid #1a2040; min-height:34px; display:flex; align-items:center;
+    gap:10px; flex-wrap:wrap;
+  }}
+  .tag {{ display:inline-block; padding:2px 9px; border-radius:10px; font-size:.73rem; font-weight:700; }}
+  .tag-up {{ background:#1a4a2a; color:#50ff90; }}
+  .tag-dn {{ background:#4a1a1a; color:#ff6060; }}
+  .tag-nc {{ background:#3a3a18; color:#ffd050; }}
+  #chartArea {{ padding:18px 28px; }}
+  #noData {{ color:#3a4a6a; text-align:center; padding:80px 20px; font-size:1rem; }}
+  #chartDiv {{ min-height:420px; }}
+  /* Changes table (#9) */
+  #changesSection {{ margin-top:18px; }}
+  #changesSection h3 {{ color:#7080a0; font-size:.85rem; text-transform:uppercase; letter-spacing:.06em; margin-bottom:8px; }}
+  .chg-table {{ width:100%; border-collapse:collapse; font-size:.82rem; }}
+  .chg-table th {{
+    background:#14142a; color:#7080a0; font-weight:600; text-align:left;
+    padding:6px 10px; border-bottom:1px solid #2a3d6a; position:sticky; top:0;
+  }}
+  .chg-table td {{ padding:5px 10px; border-bottom:1px solid #1a2040; color:#c0c8e0; }}
+  .chg-table tr:hover td {{ background:#14142a; }}
+  .chg-up {{ color:#50ff90; font-weight:600; }}
+  .chg-dn {{ color:#ff6060; font-weight:600; }}
+  .chg-nc {{ color:#ffd050; }}
+  .tbl-wrap {{ max-height:300px; overflow-y:auto; background:#0d0d1e; border:1px solid #1a2040; border-radius:5px; }}
+  .tbl-wrap::-webkit-scrollbar {{ width:5px; }}
+  .tbl-wrap::-webkit-scrollbar-thumb {{ background:#2a3d6a; border-radius:3px; }}
+  ::-webkit-scrollbar {{ width:6px; height:6px; }}
+  ::-webkit-scrollbar-track {{ background:#0d0d1e; }}
+  ::-webkit-scrollbar-thumb {{ background:#2a3d6a; border-radius:3px; }}
+  /* ---- Collapsible filter panel ---- */
+  .filter-toggle {{
+    display:flex; align-items:center; gap:8px;
+    padding:8px 28px; background:#14142a;
+    border-bottom:1px solid #1e2d52; cursor:pointer;
+    user-select:none;
+  }}
+  .filter-toggle:hover {{ background:#1a1a38; }}
+  .filter-toggle-label {{ font-size:.78rem; text-transform:uppercase; letter-spacing:.07em; color:#7080a0; font-weight:600; }}
+  .filter-toggle-arrow {{ color:#38c9ff; font-size:.9rem; transition:transform .2s; }}
+  .filter-toggle-arrow.collapsed {{ transform:rotate(-90deg); }}
+  .filter-panel {{ overflow:hidden; transition:max-height .25s ease, padding .25s ease; max-height:600px; }}
+  .filter-panel.collapsed {{ max-height:0 !important; padding-top:0 !important; padding-bottom:0 !important; border-bottom:none; }}
+  /* ---- Active filter pills shown when panel is collapsed ---- */
+  .filter-pills {{ display:flex; flex-wrap:wrap; gap:6px; margin-left:12px; }}
+  .pill {{
+    background:#0d1833; border:1px solid #2a3d6a; border-radius:10px;
+    padding:2px 10px; font-size:.72rem; color:#8090c0;
+  }}
+  .pill.active {{ background:#1a3060; border-color:#38c9ff; color:#38c9ff; }}
+
+</style>
+</head>
+<body>
+
+<header>
+  <span style="font-size:1.5rem">📊</span>
+  <h1>SF Rating Tracking Dashboard</h1>
+  <div style="margin-left:auto">
+    <button class="export-btn" onclick="exportFilteredCSV()" title="Export currently filtered change events as CSV">⬇ Export Filtered CSV</button>
+  </div>
+</header>
+
+<div class="filter-toggle" id="filterToggle" onclick="toggleFilterPanel()">
+  <span class="filter-toggle-arrow" id="filterArrow">▼</span>
+  <span class="filter-toggle-label">Filters</span>
+  <div class="filter-pills" id="filterPills"></div>
+</div>
+
+<div class="filter-panel" id="filterPanel">
+  <div class="ctrl">
+    <span class="ctrl-label">Period (Month / Date)</span>
+    <select id="monthSel" style="min-width:160px"><option value="ALL">ALL</option></select>
+  </div>
+  <div class="ctrl">
+    <span class="ctrl-label">Change Type</span>
+    <select id="changeTypeSel" style="min-width:140px">
+      <option value="ANY">ANY</option>
+      <option value="UPGRADE">UPGRADE</option>
+      <option value="DOWNGRADE">DOWNGRADE</option>
+    </select>
+  </div>
+  <div class="ctrl" style="justify-content:flex-end">
+    <span class="ctrl-label">Special</span>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:7px 12px;background:#0d1833;border:1px solid #2a3d6a;border-radius:5px;white-space:nowrap;transition:all .15s">
+      <input type="checkbox" id="mmmOnly" style="accent-color:#38c9ff;width:15px;height:15px;cursor:pointer"/>
+      <span style="color:#d0d8f0;font-size:.88rem;font-weight:600">MMM Only</span>
+      <span style="font-size:.72rem;color:#6070a0">(Group &#8839; 021)</span>
+    </label>
+  </div>
+  <div class="ctrl">
+    <span class="ctrl-label">SEC 1</span>
+    <div class="cb-group-wrap">
+      <div class="cb-group" id="sec1Group"></div>
+      <div class="btn-row">
+        <button class="btn-sm" onclick="checkAll('sec1Group')">All</button>
+        <button class="btn-sm" onclick="checkNone('sec1Group')">None</button>
+      </div>
+    </div>
+  </div>
+  <div class="ctrl">
+    <span class="ctrl-label">SEC 2</span>
+    <div class="cb-group-wrap">
+      <div class="cb-group" id="sec2Group"></div>
+      <div class="btn-row">
+        <button class="btn-sm" onclick="checkAll('sec2Group')">All</button>
+        <button class="btn-sm" onclick="checkNone('sec2Group')">None</button>
+      </div>
+    </div>
+  </div>
+  <div class="ctrl">
+    <span class="ctrl-label">SEC 3</span>
+    <div class="cb-group-wrap">
+      <div class="cb-group" id="sec3Group"></div>
+      <div class="btn-row">
+        <button class="btn-sm" onclick="checkAll('sec3Group')">All</button>
+        <button class="btn-sm" onclick="checkNone('sec3Group')">None</button>
+      </div>
+    </div>
+  </div>
+  <div class="sec-selector">
+    <span class="ctrl-label">Security Search &amp; Select</span>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input id="secSearch" type="text" placeholder="Type to search…" list="secDatalist" autocomplete="off" style="flex:1"/>
+      <button class="copy-btn" id="copySearchBtn" data-source="search" title="Copy security name">⎘ Copy</button>
+    </div>
+    <datalist id="secDatalist"></datalist>
+    <select id="secList" size="5"></select>
+  </div>
+</div>
+
+<div class="info-bar" id="infoBar">Apply filters, then select a security to view its rating chart.</div>
+
+<div id="chartArea">
+  <div id="noData">↑ Select a security above to display its rating history.</div>
+  <div id="descCard" style="display:none; padding:10px 0 6px 0; color:#8090b0; font-size:.85rem; letter-spacing:.03em;">
+    <span id="descText"></span>
+  </div>
+  <div id="chartDiv" style="display:none"></div>
+  <div id="changesSection" style="display:none">
+    <h3>Rating Change Events</h3>
+    <div class="tbl-wrap"><table class="chg-table" id="changesTable">
+      <thead><tr>
+        <th>Date</th><th>Agency</th><th>Before</th><th>After</th><th>Type</th>
+      </tr></thead>
+      <tbody id="changesTbody"></tbody>
+    </table></div>
+  </div>
+</div>
+
+<script>
+/* ================================================================
+   Data
+   ================================================================ */
+const HISTORY  = {history_json};
+const CHANGES  = {changes_json};
+const YEAR_MONTHS_GROUPED = {year_months_json};
+const SEC1_VALS = {sec1_json};
+const SEC2_VALS = {sec2_json};
+const SEC3_VALS = {sec3_json};
+const RATING_COLS  = ["RTG_FITCH_MAPPED","RTG_MOODY_MAPPED","RTG_SP_MAPPED","RTG_DBRS_MAPPED"];
+const RATING_MAP   = {rating_map_json};
+const GRPDESC      = {grpdesc_json};
+
+/* ================================================================
+   Indexes
+   ================================================================ */
+const histBySec = {{}};
+for (const r of HISTORY) {{
+  (histBySec[r.Security] = histBySec[r.Security] || []).push(r);
+}}
+for (const s of Object.keys(histBySec))
+  histBySec[s].sort((a,b) => a.As_of_Date.localeCompare(b.As_of_Date));
+
+/* ================================================================
+   Period dropdown
+   ================================================================ */
+const monthSel = document.getElementById('monthSel');
+for (const [ym, days] of Object.entries(YEAR_MONTHS_GROUPED)) {{
+  if (days.length === 1) {{
+    const o = document.createElement('option');
+    o.value = days[0]; o.textContent = days[0];
+    monthSel.appendChild(o);
+  }} else {{
+    const grpOpt = document.createElement('option');
+    grpOpt.value = ym; grpOpt.textContent = '📅 ' + ym;
+    grpOpt.style.fontWeight = 'bold'; grpOpt.style.color = '#38c9ff';
+    monthSel.appendChild(grpOpt);
+    for (const day of days) {{
+      const o = document.createElement('option');
+      o.value = day; o.textContent = '  ' + day;
+      monthSel.appendChild(o);
+    }}
+  }}
+}}
+
+/* ================================================================
+   Checkbox groups
+   ================================================================ */
+function buildCheckboxGroup(groupId, vals) {{
+  const g = document.getElementById(groupId);
+  g.innerHTML = '';
+  for (const v of vals) {{
+    const lbl = document.createElement('label');
+    const cb  = document.createElement('input');
+    cb.type = 'checkbox'; cb.value = v; cb.checked = true;
+    cb.addEventListener('change', onFilterChange);
+    lbl.append(cb, ' ' + v); g.appendChild(lbl);
+  }}
+}}
+buildCheckboxGroup('sec1Group', SEC1_VALS);
+buildCheckboxGroup('sec2Group', SEC2_VALS);
+buildCheckboxGroup('sec3Group', SEC3_VALS);
+
+function getChecked(id) {{
+  return Array.from(document.querySelectorAll('#'+id+' input[type=checkbox]:checked')).map(c=>c.value);
+}}
+function checkAll(id)  {{ document.querySelectorAll('#'+id+' input').forEach(c=>{{c.checked=true;}});  onFilterChange(); }}
+function checkNone(id) {{ document.querySelectorAll('#'+id+' input').forEach(c=>{{c.checked=false;}}); onFilterChange(); }}
+
+/* ================================================================
+   Filtering
+   ================================================================ */
+function getFilteredSecurities() {{
+  const month   = monthSel.value;
+  const chgTyp  = document.getElementById('changeTypeSel').value;
+  const mmmOnly = document.getElementById('mmmOnly').checked;
+  const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
+
+  /* When MMM Only is on: start from ALL securities in HISTORY that contain
+     "021" in Group_Description, then optionally narrow by period/change type.
+     When MMM Only is off: keep existing behaviour (only secs that have changes). */
+  let secSet;
+  if (mmmOnly) {{
+    /* Universe = every security in HISTORY whose Group_Description includes "021" */
+    secSet = new Set(
+      Object.keys(histBySec).filter(sec => (GRPDESC[sec] || '').includes('021'))
+    );
+    /* Then narrow by period / change type if they are active */
+    if (month !== 'ALL' || chgTyp !== 'ANY') {{
+      const filtered = CHANGES.filter(c => {{
+        if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
+        if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+        return true;
+      }});
+      const changedSecs = new Set(filtered.map(c => c.Security));
+      secSet = new Set([...secSet].filter(s => changedSecs.has(s)));
+    }}
+  }} else {{
+    const filtered = CHANGES.filter(c => {{
+      if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
+      if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+      return true;
+    }});
+    secSet = new Set(filtered.map(c => c.Security));
+  }}
+
+  return [...secSet].filter(sec => {{
+    const rows = histBySec[sec] || [];
+    return rows.some(r =>
+      (!s1.length || s1.includes(String(r['SEC 1']))) &&
+      (!s2.length || s2.includes(String(r['SEC 2']))) &&
+      (!s3.length || s3.includes(String(r['SEC 3'])))
+    );
+  }}).sort();
+}}
+
+/* ================================================================
+   Security selector
+   ================================================================ */
+const secSearch   = document.getElementById('secSearch');
+const secList     = document.getElementById('secList');
+const secDatalist = document.getElementById('secDatalist');
+let currentSecs   = [];
+
+function populateSecList(secs) {{
+  currentSecs = secs;
+  secList.innerHTML = ''; secDatalist.innerHTML = '';
+  for (const s of secs) {{
+    const o = document.createElement('option'); o.value = o.textContent = s; secList.appendChild(o);
+    const d = document.createElement('option'); d.value = s; secDatalist.appendChild(d);
+  }}
+}}
+secSearch.addEventListener('input', () => {{
+  const q = secSearch.value.trim().toLowerCase();
+  secList.innerHTML = '';
+  for (const s of (q ? getFilteredSecurities().filter(s=>s.toLowerCase().includes(q)) : getFilteredSecurities())) {{
+    const o = document.createElement('option'); o.value = o.textContent = s; secList.appendChild(o);
+  }}
+}});
+secSearch.addEventListener('change', () => {{
+  const q = secSearch.value.trim();
+  if (currentSecs.includes(q)) drawChart(q);
+}});
+secList.addEventListener('change', () => {{
+  if (secList.value) {{ secSearch.value = secList.value; drawChart(secList.value); }}
+}});
+
+function onFilterChange() {{
+  const secs = getFilteredSecurities();
+  populateSecList(secs);
+  document.getElementById('infoBar').textContent =
+    secs.length + ' securities match current filters. Select one to view its chart.';
+  const cur = secSearch.value.trim();
+  if (cur && !secs.includes(cur)) {{
+    secSearch.value = '';
+    document.getElementById('chartDiv').style.display = 'none';
+    document.getElementById('noData').style.display = '';
+    document.getElementById('changesSection').style.display = 'none';
+    document.getElementById('descCard').style.display = 'none';
+  }}
+  updateFilterPills();
+}}
+
+/* Show active filter pills in the toggle bar when panel is collapsed */
+function updateFilterPills() {{
+  const pills = document.getElementById('filterPills');
+  pills.innerHTML = '';
+  const month  = monthSel.value;
+  const chgTyp = document.getElementById('changeTypeSel').value;
+  const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
+  const allS1 = SEC1_VALS.length === s1.length, allS2 = SEC2_VALS.length === s2.length, allS3 = SEC3_VALS.length === s3.length;
+
+  const addPill = (label, active) => {{
+    const p = document.createElement('span');
+    p.className = 'pill' + (active ? ' active' : '');
+    p.textContent = label;
+    pills.appendChild(p);
+  }};
+  addPill('Period: ' + month,  month  !== 'ALL');
+  addPill('Type: '  + chgTyp, chgTyp !== 'ANY');
+  if (!allS1) addPill('SEC1: ' + s1.join(','), true);
+  if (!allS2) addPill('SEC2: ' + s2.join(','), true);
+  if (!allS3) addPill('SEC3: ' + s3.join(','), true);
+}}
+
+function toggleFilterPanel() {{
+  const panel = document.getElementById('filterPanel');
+  const arrow = document.getElementById('filterArrow');
+  const collapsed = panel.classList.toggle('collapsed');
+  arrow.classList.toggle('collapsed', collapsed);
+  /* Only show pills when collapsed */
+  document.getElementById('filterPills').style.display = collapsed ? '' : 'none';
+}}
+monthSel.addEventListener('change', onFilterChange);
+document.getElementById('changeTypeSel').addEventListener('change', onFilterChange);
+document.getElementById('mmmOnly').addEventListener('change', onFilterChange);
+
+/* ================================================================
+   Rating helpers
+   ================================================================ */
+const AGENCY_COLORS = {{
+  RTG_FITCH_MAPPED: '#38c9ff', RTG_MOODY_MAPPED: '#ff8c50',
+  RTG_SP_MAPPED:    '#60ff80', RTG_DBRS_MAPPED:  '#e070ff',
+}};
+const AGENCY_LABELS = {{
+  RTG_FITCH_MAPPED: 'Fitch', RTG_MOODY_MAPPED: "Moody's",
+  RTG_SP_MAPPED:    'S&P',   RTG_DBRS_MAPPED:  'DBRS',
+}};
+const AGENCY_SHORT = {{
+  RTG_FITCH_MAPPED: 'F', RTG_MOODY_MAPPED: 'M', RTG_SP_MAPPED: 'S', RTG_DBRS_MAPPED: 'D',
+}};
+
+function ratingLabel(v) {{
+  if (v === null || v === undefined) return 'N/A';
+  const letter = RATING_MAP[String(Math.round(v))];
+  if (letter) return letter;
+  if (v === 23) return 'NR';
+  if (v === 24) return 'PIF';
+  return String(Math.round(v));
+}}
+
+function buildYAxisTicks() {{
+  const vals = [], labels = [];
+  for (let i = 1; i <= 24; i++) {{
+    const letter = RATING_MAP[String(i)];
+    if (letter) {{ vals.push(i); labels.push(letter); }}
+  }}
+  return {{ tickvals: vals, ticktext: labels }};
+}}
+const Y_TICKS = buildYAxisTicks();
+
+/* ================================================================
+   Chart  (#8 — change annotation shapes)
+   ================================================================ */
+function drawChart(security) {{
+  const rows = histBySec[security] || [];
+  if (!rows.length) return;
+
+  const traces = [];
+  for (const col of RATING_COLS) {{
+    const x = [], y = [], txt = [];
+    for (const r of rows) {{
+      const v = r[col];
+      if (v === null || v === undefined) continue;
+      x.push(r.As_of_Date); y.push(v); txt.push(ratingLabel(v));
+    }}
+    if (y.length > 0 && y.every(v => v === 23)) continue;
+    traces.push({{
+      x, y, text: txt, mode: 'lines+markers',
+      name: AGENCY_LABELS[col],
+      line: {{ color: AGENCY_COLORS[col], width: 2.5 }},
+      marker: {{ size: 7, symbol: 'circle' }},
+      hovertemplate: '<b>%{{x}}</b><br>' + AGENCY_LABELS[col] + ': <b>%{{text}}</b><extra></extra>',
+    }});
+  }}
+
+  /* #8 — Build change annotation vertical lines */
+  const secChanges = CHANGES.filter(c => c.Security === security);
+  const shapes = [{{
+    type:'line', xref:'paper', yref:'y', x0:0, x1:1, y0:22.5, y1:22.5,
+    line: {{ color:'#444466', width:1, dash:'dot' }},
+  }}];
+  const annotations = [];
+
+  /* Group changes by date so we don't draw duplicate lines */
+  const changeDates = [...new Set(secChanges.map(c => c.As_of_Date))];
+  for (const dt of changeDates) {{
+    const dayChanges = secChanges.filter(c => c.As_of_Date === dt);
+    const hasUp  = dayChanges.some(c => c.Change_Type === 'UPGRADE');
+    const hasDn  = dayChanges.some(c => c.Change_Type === 'DOWNGRADE');
+    const color  = hasUp && hasDn ? '#ffd050' : hasUp ? '#50ff90' : hasDn ? '#ff6060' : '#ffd050';
+    shapes.push({{
+      type:'line', xref:'x', yref:'paper', x0:dt, x1:dt, y0:0, y1:1,
+      line: {{ color, width:1.5, dash:'dot' }},
+    }});
+    /* Small label showing agency initials at top */
+    const initials = dayChanges.map(c => AGENCY_SHORT[c.Agency_Column]).join('');
+    annotations.push({{
+      x: dt, y: 1, xref:'x', yref:'paper', xanchor:'center', yanchor:'bottom',
+      text: initials, showarrow: false,
+      font: {{ color, size: 9 }}, bgcolor:'rgba(0,0,0,0)',
+    }});
+  }}
+
+  const layout = {{
+    template: 'plotly_dark', paper_bgcolor:'#12121f', plot_bgcolor:'#0d1426',
+    title: {{
+      text: (function() {{
+        const r = rows[0] || {{}};
+        const parts = ['Rating History — <b>' + security + '</b>'];
+        if (r['SEC 1'])       parts.push(r['SEC 1']);
+        if (r['SEC 2'])       parts.push(r['SEC 2']);
+        if (r['SEC 3'])       parts.push(r['SEC 3']);
+        if (r['Description']) parts.push(r['Description']);
+        return parts.join(' &nbsp;|&nbsp; ');
+      }})(),
+      font: {{ color:'#38c9ff', size:15, family:'Segoe UI, Arial' }}, x:0.01, xanchor:'left',
+    }},
+    xaxis: {{
+      title: {{ text:'Date', font:{{color:'#7080a0'}} }},
+      gridcolor:'#1a2a44', showgrid:true, tickfont:{{color:'#8090b0'}},
+      showline:true, linecolor:'#2a3d6a',
+    }},
+    yaxis: {{
+      title: {{ text:'Rating', font:{{color:'#7080a0'}} }},
+      gridcolor:'#1a2a44', showgrid:true, tickfont:{{color:'#8090b0', size:11}},
+      range:[0,25.5], tickvals:Y_TICKS.tickvals, ticktext:Y_TICKS.ticktext,
+      showline:true, linecolor:'#2a3d6a',
+    }},
+    legend: {{ orientation:'h', y:-0.18, x:0, font:{{color:'#a0b0d0',size:12}}, bgcolor:'rgba(0,0,0,0)' }},
+    margin: {{ t:56, b:90, l:66, r:24 }},
+    hovermode:'x unified',
+    hoverlabel: {{ bgcolor:'#0d1426', bordercolor:'#2a3d6a', font:{{color:'#d0d8f0',size:12}} }},
+    shapes, annotations,
+  }};
+
+  document.getElementById('noData').style.display = 'none';
+
+  /* Description card above chart */
+  const descCard = document.getElementById('descCard');
+  const descText = document.getElementById('descText');
+  const desc = (rows[0] || {{}})['Description'];
+  if (desc) {{
+    descText.textContent = '📋 ' + desc;
+    descCard.style.display = '';
+  }} else {{
+    descCard.style.display = 'none';
+  }}
+
+  const chartDiv = document.getElementById('chartDiv');
+  chartDiv.style.display = '';
+  Plotly.react(chartDiv, traces, layout, {{ responsive:true, displayModeBar:true, displaylogo:false }});
+
+  /* Info bar */
+  const nUp = secChanges.filter(c=>c.Change_Type==='UPGRADE').length;
+  const nDn = secChanges.filter(c=>c.Change_Type==='DOWNGRADE').length;
+  const nNc = secChanges.filter(c=>c.Change_Type==='NON_COMPARABLE').length;
+  document.getElementById('infoBar').innerHTML =
+    '<b style="color:#d0d8f0">' + security + '</b>' +
+    ' <button class="copy-btn" id="copyInfoBtn" data-source="info" title="Copy security name">⎘ Copy</button>' +
+    ' &nbsp;|&nbsp; ' + rows.length + ' data points' +
+    ' &nbsp;|&nbsp; ' + secChanges.length + ' changes:' +
+    ' <span class="tag tag-up">▲ ' + nUp + ' Upgrades</span>' +
+    ' <span class="tag tag-dn">▼ ' + nDn + ' Downgrades</span>' +
+    ' <span class="tag tag-nc">~ ' + nNc + ' Non-Comparable</span>';
+
+  /* #9 — Changes table */
+  renderChangesTable(secChanges);
+}}
+
+/* ================================================================
+   Changes table  (#9)
+   ================================================================ */
+function renderChangesTable(secChanges) {{
+  const tbody = document.getElementById('changesTbody');
+  tbody.innerHTML = '';
+  if (!secChanges.length) {{
+    document.getElementById('changesSection').style.display = 'none';
+    return;
+  }}
+  const sorted = secChanges.slice().sort((a,b) => b.As_of_Date.localeCompare(a.As_of_Date));
+  for (const c of sorted) {{
+    const cls = c.Change_Type === 'UPGRADE' ? 'chg-up' : c.Change_Type === 'DOWNGRADE' ? 'chg-dn' : 'chg-nc';
+    const arrow = c.Change_Type === 'UPGRADE' ? '▲' : c.Change_Type === 'DOWNGRADE' ? '▼' : '~';
+    const bLabel = ratingLabel(c.RTG_MAPPED_before);
+    const aLabel = ratingLabel(c.RTG_MAPPED_after);
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>' + c.As_of_Date + '</td>' +
+      '<td>' + AGENCY_LABELS[c.Agency_Column] + '</td>' +
+      '<td>' + bLabel + '</td>' +
+      '<td>' + aLabel + '</td>' +
+      '<td class="' + cls + '">' + arrow + ' ' + c.Change_Type + '</td>';
+    tbody.appendChild(tr);
+  }}
+  document.getElementById('changesSection').style.display = '';
+}}
+
+/* ================================================================
+   Copy to clipboard  (event delegation — no inline onclick needed)
+   ================================================================ */
+function copySecurity(btn) {{
+  const sec = document.getElementById('secSearch').value.trim();
+  if (!sec || !btn) return;
+  const finish = () => {{
+    const prev = btn.textContent;
+    btn.textContent = '✓ Copied'; btn.classList.add('copied');
+    setTimeout(() => {{ btn.textContent = prev; btn.classList.remove('copied'); }}, 1500);
+  }};
+  navigator.clipboard.writeText(sec).then(finish).catch(() => {{
+    const ta = document.createElement('textarea');
+    ta.value = sec; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    finish();
+  }});
+}}
+
+/* Wire copy buttons via event delegation so dynamically-added copyInfoBtn also works */
+document.addEventListener('click', function(e) {{
+  const btn = e.target.closest('[data-source]');
+  if (btn) copySecurity(btn);
+}});
+
+/* ================================================================
+   Export filtered CSV  (#7)
+   ================================================================ */
+function exportFilteredCSV() {{
+  const month  = monthSel.value;
+  const chgTyp = document.getElementById('changeTypeSel').value;
+  const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
+
+  const filtered = CHANGES.filter(c => {{
+    if (month !== 'ALL') {{
+      if (c.As_of_Date !== month && c.YearMonth !== month) return false;
+    }}
+    if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+    const rows = histBySec[c.Security] || [];
+    return rows.some(r =>
+      (!s1.length || s1.includes(String(r['SEC 1']))) &&
+      (!s2.length || s2.includes(String(r['SEC 2']))) &&
+      (!s3.length || s3.includes(String(r['SEC 3'])))
+    );
+  }});
+
+  if (!filtered.length) {{ alert('No data matches current filters.'); return; }}
+
+  const cols = Object.keys(filtered[0]);
+  const header = cols.join(',');
+  const rows = filtered.map(r =>
+    cols.map(k => {{
+      const v = r[k] == null ? '' : String(r[k]);
+      return v.includes(',') || v.includes('"') ? '"' + v.replace(/"/g,'""') + '"' : v;
+    }}).join(',')
+  );
+  const csv  = [header, ...rows].join('\\r\\n');
+  const blob = new Blob([csv], {{ type:'text/csv' }});
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'SF_Rating_Changes_Filtered.csv';
+  a.click(); URL.revokeObjectURL(url);
+}}
+
+/* ================================================================
+   Initialise
+   ================================================================ */
+document.getElementById('filterPills').style.display = 'none';
+onFilterChange();
+</script>
+</body>
+</html>"""
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    log.info("HTML saved: %s", out_path)
+
+
+# ---------------------------------------------------------------------------
+# CLI  (#3 #10)
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="SF Rating Tracking – process SF*.xlsx and produce Excel + HTML outputs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--pattern",             default="SF*.xlsx",
+                        help="Glob pattern for input Excel files.")
+    parser.add_argument("--sheet",               default=0,
+                        help="Sheet name or zero-based index to read.")
+    parser.add_argument("--out-xlsx",            default="SF_Rating_Tracking_Output.xlsx",
+                        help="Output Excel workbook path.")
+    parser.add_argument("--out-html",            default="SF_Rating_Tracking_Interactive.html",
+                        help="Output HTML dashboard path.")
+    parser.add_argument("--rating-map",          default="RatingMapNew.xlsx",
+                        help="Excel/CSV with 'Number #' and 'Final Rating' columns.")
+    parser.add_argument("--since",               default=None,
+                        help="Only include data on or after this date (YYYY-MM-DD).  #10")
+    parser.add_argument("--max-html-securities", default=500, type=int,
+                        help="Cap number of securities embedded in HTML to avoid huge files.  #2")
+    parser.add_argument("--log-file",            default=None,
+                        help="Write log output to this file in addition to stdout.  #4")
+    parser.add_argument("--verbose",             action="store_true",
+                        help="Enable DEBUG-level logging.  #4")
+    parser.add_argument("--dry-run",             action="store_true",
+                        help="Show what would be processed without writing any output files.  #3")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    _setup_logging(args.verbose, args.log_file)
+
+    sheet = args.sheet
+    try:
+        sheet = int(sheet)
+    except (TypeError, ValueError):
+        pass
+
+    since: Optional[pd.Timestamp] = None
+    if args.since:
+        try:
+            since = pd.Timestamp(args.since)
+        except Exception:
+            log.error("Invalid --since value '%s'. Expected YYYY-MM-DD.", args.since)
+            sys.exit(1)
+
+    log.info("=== SF Rating Tracker ===")
+    log.info("Input pattern        : %s", args.pattern)
+    log.info("Sheet                : %s", sheet)
+    log.info("Rating map           : %s", args.rating_map)
+    log.info("Since                : %s", since.date() if since else "all dates")
+    log.info("Max HTML securities  : %d", args.max_html_securities)
+    log.info("Excel output         : %s", args.out_xlsx)
+    log.info("HTML output          : %s", args.out_html)
+    if args.dry_run:
+        log.info("DRY RUN — no files will be written.")
+
+    # #3 — dry-run: just show what files match
+    if args.dry_run:
+        files = sorted(glob.glob(args.pattern))
+        log.info("Files that would be processed (%d):", len(files))
+        for f in files:
+            sz = os.path.getsize(f) / 1024
+            log.info("  %s  (%.1f KB)", f, sz)
+        log.info("Dry run complete — nothing written.")
+        return
+
+    # Step 0: rating map
+    log.info("Step 0: Loading rating map…")
+    rating_map = load_rating_map(args.rating_map)
+    log.info("  → %d entries", len(rating_map)) if rating_map else \
+        log.warning("  → No rating map loaded; hover labels will show numbers only.")
+
+    # Step 1: read files
+    log.info("Step 1: Reading input files…")
+    history = read_sf_files(args.pattern, sheet, since=since)
+    log.info("  → %d unique (Security, As_of_Date) rows loaded.", len(history))
+    if history.empty:
+        log.warning("No data loaded — outputs will be empty.")
+
+    # Step 2: detect changes
+    log.info("Step 2: Detecting rating changes…")
+    changes = detect_changes(history)
+    n_up = int((changes["Change_Type"] == "UPGRADE").sum())
+    n_dn = int((changes["Change_Type"] == "DOWNGRADE").sum())
+    n_nc = int((changes["Change_Type"] == "NON_COMPARABLE").sum())
+    log.info("  → %d change events  (UP=%d, DOWN=%d, NON_COMPARABLE=%d)",
+             len(changes), n_up, n_dn, n_nc)
+
+    # Step 3: summary
+    log.info("Step 3: Building summary…")
+    summary = build_summary(history, changes)
+    log.info("  → %d securities in summary.", len(summary))
+
+    # Step 4: Excel
+    log.info("Step 4: Writing Excel workbook…")
+    write_excel(history, changes, summary, args.out_xlsx)
+
+    # Step 5: HTML
+    log.info("Step 5: Building interactive HTML…")
+    build_html(history, changes, args.out_html,
+               rating_map=rating_map,
+               max_securities=args.max_html_securities)
+
+    log.info("=== Done ===")
+
+
+if __name__ == "__main__":
+    main()
