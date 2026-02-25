@@ -860,17 +860,35 @@ function getFilteredSecurities() {{
   const mmmOnly = document.getElementById('mmmOnly').checked;
   const s1 = getChecked('sec1Group'), s2 = getChecked('sec2Group'), s3 = getChecked('sec3Group');
 
-  const filtered = CHANGES.filter(c => {{
-    if (month !== 'ALL') {{
-      if (c.As_of_Date !== month && c.YearMonth !== month) return false;
+  /* When MMM Only is on: start from ALL securities in HISTORY that contain
+     "021" in Group_Description, then optionally narrow by period/change type.
+     When MMM Only is off: keep existing behaviour (only secs that have changes). */
+  let secSet;
+  if (mmmOnly) {{
+    /* Universe = every security in HISTORY whose Group_Description includes "021" */
+    secSet = new Set(
+      Object.keys(histBySec).filter(sec => (GRPDESC[sec] || '').includes('021'))
+    );
+    /* Then narrow by period / change type if they are active */
+    if (month !== 'ALL' || chgTyp !== 'ANY') {{
+      const filtered = CHANGES.filter(c => {{
+        if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
+        if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+        return true;
+      }});
+      const changedSecs = new Set(filtered.map(c => c.Security));
+      for (const s of secSet) {{ if (!changedSecs.has(s)) secSet.delete(s); }}
     }}
-    if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
-    return true;
-  }});
+  }} else {{
+    const filtered = CHANGES.filter(c => {{
+      if (month !== 'ALL' && c.As_of_Date !== month && c.YearMonth !== month) return false;
+      if (chgTyp !== 'ANY' && c.Change_Type !== chgTyp) return false;
+      return true;
+    }});
+    secSet = new Set(filtered.map(c => c.Security));
+  }}
 
-  const secSet = new Set(filtered.map(c => c.Security));
   return [...secSet].filter(sec => {{
-    if (mmmOnly && !(GRPDESC[sec] || '').includes('021')) return false;
     const rows = histBySec[sec] || [];
     return rows.some(r =>
       (!s1.length || s1.includes(String(r['SEC 1']))) &&
