@@ -877,7 +877,7 @@ function getFilteredSecurities() {{
         return true;
       }});
       const changedSecs = new Set(filtered.map(c => c.Security));
-      for (const s of secSet) {{ if (!changedSecs.has(s)) secSet.delete(s); }}
+      secSet = new Set([...secSet].filter(s => changedSecs.has(s)));
     }}
   }} else {{
     const filtered = CHANGES.filter(c => {{
