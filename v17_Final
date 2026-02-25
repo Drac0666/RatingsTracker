@@ -165,9 +165,13 @@ def _build_column_map(raw_cols: list) -> dict:
         "moody": "RTG_MOODY_MAPPED", "moodys": "RTG_MOODY_MAPPED", "moody s": "RTG_MOODY_MAPPED",
         "sp": "RTG_SP_MAPPED", "s p": "RTG_SP_MAPPED", "s&p": "RTG_SP_MAPPED",
         "dbrs": "RTG_DBRS_MAPPED",
-        # #5 — Description
+        # Optional extra columns
         "description": "Description", "desc": "Description", "name": "Description",
         "security name": "Description", "bond name": "Description",
+        "group description": "Group_Description", "group_description": "Group_Description",
+        "grp description": "Group_Description", "grp_description": "Group_Description",
+        "group desc": "Group_Description", "grp desc": "Group_Description",
+        "groupdescription": "Group_Description",
     })
     return {raw: lookup[_normalise_key(raw)] for raw in raw_cols if _normalise_key(raw) in lookup}
 
@@ -179,8 +183,8 @@ def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in CANONICAL_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns after normalisation: {missing}")
-    keep = CANONICAL_COLUMNS + (["Description"] if "Description" in df.columns else [])
-    return df[keep]
+    extra = [c for c in ["Description", "Group_Description"] if c in df.columns]
+    return df[CANONICAL_COLUMNS + extra]
 
 
 # ---------------------------------------------------------------------------
