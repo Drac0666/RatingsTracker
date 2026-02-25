@@ -1119,7 +1119,7 @@ function exportFilteredCSV() {{
       return v.includes(',') || v.includes('"') ? '"' + v.replace(/"/g,'""') + '"' : v;
     }}).join(',')
   );
-  const csv  = [header, ...rows].join('\r\n');
+  const csv  = [header, ...rows].join('\\r\\n');
   const blob = new Blob([csv], {{ type:'text/csv' }});
   const url  = URL.createObjectURL(blob);
   const a = document.createElement('a');
